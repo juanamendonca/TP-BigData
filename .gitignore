@@ -1,0 +1,14 @@
+# Python cache and environments
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+
+# Keep only landing data in repo
+/datalake/*
+!/datalake/landing/
+!/datalake/landing/**
+
+# Ignore generated text extracts from partials
+*parcial*.txt
