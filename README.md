@@ -208,35 +208,46 @@ En Linux/macOS usar los mismos comandos en shell bash/zsh.
 - Quarantine late: datalake/bronze/quarantine/usage_events_late/event_date=YYYY-MM-DD/
 - Checkpoints: datalake/checkpoints/streaming_landing_to_bronze/
 
-### Nota de entorno (importante)
+## Parte 3: Bronze -> Silver (PySpark)
 
-Si aparece el error "getSubject is not supported" al iniciar Spark, usar Java 17 para ejecutar PySpark.
-Con versiones de Java mas nuevas puede fallar Hadoop en Windows.
+Script principal:
+- bronze_to_silver.py
 
-### Troubleshooting rapido (Windows)
+### Que hace el script
 
-Si aparece "UnsupportedOperationException: getSubject is not supported":
+- Lee eventos desde Bronze streaming y 1 maestro desde Bronze batch (`customers_orgs`).
+- Aplica limpieza/conformance de tipos y campos (event_ts, value_num, metric, unit, costos).
+- Aplica join de enriquecimiento por `org_id` con datos de organizacion.
+- Activa reglas de calidad:
+  - `event_id` no nulo.
+  - `event_id` unico.
+  - `cost_usd_increment >= -0.01` (se mantiene en Silver con `anomaly_cost_flag`).
+  - `unit` no nulo cuando `value` existe.
+- Envia registros con fallas duras a quarantine y guarda muestras.
+- Genera features diarias por `event_date`, `org_id`, `service`:
+  - `daily_cost_usd`
+  - `requests`
+  - `genai_tokens_total`
+  - `carbon_kg_total`
 
-1) Reinstalar PySpark estable para este TP:
+### Como correr Parte 3
+
+Windows PowerShell:
 
 ```powershell
-python -m pip uninstall -y pyspark py4j
-python -m pip install pyspark==3.5.2
+python bronze_to_silver.py
 ```
 
-2) Configurar Java 17 para la sesion actual:
+Linux/macOS:
 
-```powershell
-$env:JAVA_HOME = "C:\Program Files\Java\jdk-17"
-$env:Path = "$env:JAVA_HOME\bin;$env:Path"
-java -version
+```bash
+python bronze_to_silver.py
 ```
 
-3) Volver a correr:
+### Salidas esperadas Parte 3
 
-```powershell
-python batch_landing_to_bronze.py --batch-date 2026-06-15
-python streaming_landing_to_bronze.py --watermark-delay "2 days" --late-threshold-hours 48 --max-files-per-trigger 50
-```
-
-Si no tenes jdk-17 instalado, instalar Temurin/Oracle JDK 17 y repetir los pasos.
+- Silver enriquecido: `datalake/silver/events_enriched/event_date=YYYY-MM-DD/`
+- Silver features: `datalake/silver/features_org_daily/event_date=YYYY-MM-DD/`
+- Quarantine: `datalake/silver/quarantine/events_quality_issues/event_date=YYYY-MM-DD/`
+- Muestras de quarantine: `datalake/silver/quarantine/samples/`
+- Manifest: `datalake/silver/_control/manifest.json`
