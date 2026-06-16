@@ -90,22 +90,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def load_bronze_inputs(spark: SparkSession, bronze_root: Path) -> tuple[DataFrame, DataFrame]:
     usage_path = bronze_root / "streaming" / "usage_events"
-    late_usage_path = bronze_root / "quarantine" / "usage_events_late"
     customers_path = bronze_root / "batch" / "customers_orgs"
 
-    usage_sources: List[str] = []
-    if has_parquet_data(usage_path):
-        usage_sources.append(str(usage_path))
-    if has_parquet_data(late_usage_path):
-        usage_sources.append(str(late_usage_path))
-
-    if not usage_sources:
+    if not has_parquet_data(usage_path):
         raise FileNotFoundError(
-            "No Bronze usage parquet data found. Expected at least one of: "
-            f"{usage_path} or {late_usage_path}."
+            "No Bronze usage parquet data found. Expected path: "
+            f"{usage_path}."
         )
 
-    usage = spark.read.parquet(*usage_sources)
+    usage = spark.read.parquet(str(usage_path))
     customers = spark.read.parquet(str(customers_path)).select(
         "org_id",
         "org_name",
@@ -119,11 +112,8 @@ def load_bronze_inputs(spark: SparkSession, bronze_root: Path) -> tuple[DataFram
 
 
 def prepare_events(usage: DataFrame) -> DataFrame:
-    # Bronze already has dedupe from streaming, but we enforce uniqueness for idempotent re-runs.
-    deduped = usage.dropDuplicates(["event_id"])
-
     prepared = (
-        deduped.withColumn("event_ts", F.to_timestamp("event_ts"))
+        usage.withColumn("event_ts", F.to_timestamp("event_ts"))
         .withColumn("event_date", F.to_date("event_ts"))
         .withColumn("ingest_ts", F.to_timestamp("ingest_ts"))
         .withColumn("value_num", F.col("value").cast("double"))
@@ -260,6 +250,24 @@ def write_outputs(
     sample.write.mode("overwrite").json(str(quarantine_samples_path))
 
 
+def print_verify_counts(spark: SparkSession, silver_root: Path) -> None:
+    verify_paths = [
+        ("silver/events_enriched", silver_root / "events_enriched"),
+        ("silver/features_org_daily", silver_root / "features_org_daily"),
+        ("silver/quarantine/events_quality_issues", silver_root / "quarantine" / "events_quality_issues"),
+    ]
+
+    for label, path in verify_paths:
+        if has_parquet_data(path):
+            total_rows = spark.read.parquet(str(path)).count()
+            print(
+                f"[VERIFY] {label} total_rows={total_rows} "
+                "(compare this value across reruns for idempotency)"
+            )
+        else:
+            print(f"[WARN] Verification skipped: no parquet data found at {path}")
+
+
 def write_manifest(
     silver_root: Path,
     stats: SilverStats,
@@ -304,15 +312,25 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         records_bronze_input = usage.count()
         prepared = prepare_events(usage)
-        records_after_event_dedupe = prepared.count()
+        records_after_event_dedupe = prepared.dropDuplicates(["event_id"]).count()
 
         flagged = apply_quality_rules(prepared)
         silver_events, quarantine = split_silver_and_quarantine(flagged)
 
+        records_flagged_total = flagged.count()
+        records_hard_fail = quarantine.count()
+        records_pre_enrichment = silver_events.count()
+
+        records_without_customer_match = (
+            silver_events.select("org_id").dropDuplicates(["org_id"])
+            .join(customers.select("org_id").dropDuplicates(["org_id"]), on="org_id", how="left_anti")
+            .count()
+        )
+
         enriched = enrich_with_master(silver_events, customers)
         features = build_daily_features(enriched)
 
-        records_quarantine = quarantine.count()
+        records_quarantine = records_hard_fail
         records_silver_events = enriched.count()
         records_silver_features = features.count()
 
@@ -323,6 +341,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             quarantine=quarantine,
             sample_quarantine=args.sample_quarantine,
         )
+
+        print_verify_counts(spark, args.silver_root)
 
         stats = SilverStats(
             records_bronze_input=records_bronze_input,
@@ -337,6 +357,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         print(f"[INFO] Bronze records: {records_bronze_input}")
         print(f"[INFO] After dedupe: {records_after_event_dedupe}")
+        print(f"[INFO] Flagged total (before split): {records_flagged_total}")
+        print(f"[INFO] Hard-fail quality records: {records_hard_fail}")
+        print(f"[INFO] Silver events before enrichment: {records_pre_enrichment}")
+        print(f"[INFO] Distinct org_id without customers match: {records_without_customer_match}")
         print(f"[INFO] Quarantine records: {records_quarantine}")
         print(f"[INFO] Silver events: {records_silver_events}")
         print(f"[INFO] Silver features: {records_silver_features}")
