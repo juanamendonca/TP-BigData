@@ -5,9 +5,10 @@ Batch ingestion pipeline: landing CSV -> bronze Parquet (PySpark).
 Aligned with first + second partial requirements for batch Bronze:
 - explicit schemas,
 - Parquet output,
-- partitioning by batch_date,
+- sensible per-table partitioning,
 - technical columns ingest_ts and source_file,
 - deduplication when applicable,
+- basic non-null quality filters on critical keys,
 - idempotent re-run by partition overwrite.
 """
 
@@ -31,6 +32,8 @@ class TableConfig:
     csv_file: str
     schema: T.StructType
     dedupe_keys: List[str]
+    partition_col: str
+    required_not_null: List[str]
 
 
 @dataclass
@@ -38,10 +41,13 @@ class TableStats:
     table: str
     source_path: str
     records_read: int
+    records_after_quality: int
     records_after_dedupe: int
     records_written: int
     output_path: str
     dedupe_keys: List[str]
+    partition_col: str
+    required_not_null: List[str]
 
 
 TABLES: Dict[str, TableConfig] = {
@@ -60,6 +66,8 @@ TABLES: Dict[str, TableConfig] = {
             ]
         ),
         dedupe_keys=["invoice_id"],
+        partition_col="month",
+        required_not_null=["invoice_id", "org_id", "month"],
     ),
     "customers_orgs": TableConfig(
         csv_file="customers_orgs.csv",
@@ -79,6 +87,8 @@ TABLES: Dict[str, TableConfig] = {
             ]
         ),
         dedupe_keys=["org_id"],
+        partition_col="load_date",
+        required_not_null=["org_id"],
     ),
     "marketing_touches": TableConfig(
         csv_file="marketing_touches.csv",
@@ -94,6 +104,8 @@ TABLES: Dict[str, TableConfig] = {
             ]
         ),
         dedupe_keys=["touch_id"],
+        partition_col="touch_date",
+        required_not_null=["touch_id", "org_id", "touch_date"],
     ),
     "nps_surveys": TableConfig(
         csv_file="nps_surveys.csv",
@@ -106,6 +118,8 @@ TABLES: Dict[str, TableConfig] = {
             ]
         ),
         dedupe_keys=["org_id", "survey_date"],
+        partition_col="survey_date",
+        required_not_null=["org_id", "survey_date"],
     ),
     "resources": TableConfig(
         csv_file="resources.csv",
@@ -121,6 +135,8 @@ TABLES: Dict[str, TableConfig] = {
             ]
         ),
         dedupe_keys=["resource_id"],
+        partition_col="batch_date",
+        required_not_null=["resource_id", "org_id"],
     ),
     "support_tickets": TableConfig(
         csv_file="support_tickets.csv",
@@ -137,6 +153,8 @@ TABLES: Dict[str, TableConfig] = {
             ]
         ),
         dedupe_keys=["ticket_id"],
+        partition_col="created_date",
+        required_not_null=["ticket_id", "org_id", "created_date"],
     ),
     "users": TableConfig(
         csv_file="users.csv",
@@ -152,6 +170,8 @@ TABLES: Dict[str, TableConfig] = {
             ]
         ),
         dedupe_keys=["user_id"],
+        partition_col="load_date",
+        required_not_null=["user_id", "org_id"],
     ),
 }
 
@@ -162,6 +182,12 @@ def utc_now_iso() -> str:
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def has_parquet_data(path: Path) -> bool:
+    if not path.exists():
+        return False
+    return any(path.rglob("*.parquet"))
 
 
 def build_spark(app_name: str) -> SparkSession:
@@ -196,7 +222,14 @@ def load_master_csv(
         .withColumn("ingest_ts", F.current_timestamp())
         .withColumn("source_file", F.input_file_name())
         .withColumn("batch_date", F.lit(batch_date).cast("date"))
+        .withColumn("load_date", F.col("batch_date"))
     )
+
+    if "created_at" in df.columns:
+        df = df.withColumn("created_date", F.to_date("created_at"))
+    if "timestamp" in df.columns:
+        df = df.withColumn("touch_date", F.to_date("timestamp"))
+
     return df
 
 
@@ -211,28 +244,34 @@ def process_table(
     df_raw = load_master_csv(spark, table_name, cfg, landing_root, batch_date)
     records_read = df_raw.count()
 
-    df_deduped = df_raw.dropDuplicates(cfg.dedupe_keys)
+    df_quality = df_raw
+    for col_name in cfg.required_not_null:
+        df_quality = df_quality.filter(F.col(col_name).isNotNull())
+    records_after_quality = df_quality.count()
+
+    df_deduped = df_quality.dropDuplicates(cfg.dedupe_keys)
     records_after_dedupe = df_deduped.count()
 
     output_path = bronze_root / "batch" / table_name
     (
         df_deduped.write.mode("overwrite")
-        .partitionBy("batch_date")
+        .partitionBy(cfg.partition_col)
         .parquet(str(output_path))
     )
 
-    records_written = spark.read.parquet(str(output_path)).where(
-        F.col("batch_date") == F.to_date(F.lit(batch_date))
-    ).count()
+    records_written = records_after_dedupe
 
     return TableStats(
         table=table_name,
         source_path=str(landing_root / cfg.csv_file),
         records_read=records_read,
+        records_after_quality=records_after_quality,
         records_after_dedupe=records_after_dedupe,
         records_written=records_written,
         output_path=str(output_path),
         dedupe_keys=cfg.dedupe_keys,
+        partition_col=cfg.partition_col,
+        required_not_null=cfg.required_not_null,
     )
 
 
@@ -249,6 +288,7 @@ def write_manifest(
     totals = {
         "tables_processed": len(stats),
         "records_read": sum(s.records_read for s in stats),
+        "records_after_quality": sum(s.records_after_quality for s in stats),
         "records_after_dedupe": sum(s.records_after_dedupe for s in stats),
         "records_written": sum(s.records_written for s in stats),
     }
@@ -355,9 +395,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             stats.append(table_stats)
             print(
                 f"[OK] {table_name}: read={table_stats.records_read} "
+                f"after_quality={table_stats.records_after_quality} "
                 f"after_dedupe={table_stats.records_after_dedupe} "
                 f"written={table_stats.records_written}"
             )
+
+        for verify_table in selected_tables:
+            verify_path = bronze_root / "batch" / verify_table
+            if has_parquet_data(verify_path):
+                verify_count = spark.read.parquet(str(verify_path)).count()
+                print(
+                    f"[VERIFY] bronze/{verify_table} total_rows={verify_count} "
+                    "(use this value to compare reruns for idempotency)"
+                )
+            else:
+                print(
+                    f"[WARN] Verification skipped: no parquet data found at {verify_path}"
+                )
     finally:
         spark.stop()
 
@@ -374,6 +428,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(
         "[INFO] Totals: "
         f"read={sum(s.records_read for s in stats)} "
+        f"after_quality={sum(s.records_after_quality for s in stats)} "
         f"after_dedupe={sum(s.records_after_dedupe for s in stats)} "
         f"written={sum(s.records_written for s in stats)}"
     )

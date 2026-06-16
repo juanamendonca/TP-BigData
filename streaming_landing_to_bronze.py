@@ -6,9 +6,10 @@ Aligned with second partial + first partial (streaming Bronze):
 - Structured Streaming over usage_events_stream/*.jsonl
 - Explicit schema (v1 + v2 fields)
 - withWatermark + dropDuplicates(event_id)
-- Late data handling (quarantine path)
+- Watermark-driven tolerance for late events
 - Checkpointing enabled
 - Technical columns ingest_ts and source_file
+- Invalid-record quarantine including value cast errors
 - Partitioned Parquet output by event_date
 """
 
@@ -43,6 +44,12 @@ EVENT_SCHEMA = T.StructType(
 )
 
 
+def has_parquet_data(path: Path) -> bool:
+    if not path.exists():
+        return False
+    return any(path.rglob("*.parquet"))
+
+
 def build_spark(app_name: str) -> SparkSession:
     warehouse_dir = (Path.cwd() / "datalake" / "_spark_warehouse").resolve()
     spark = (
@@ -61,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Streaming load from landing usage_events_stream to bronze parquet with "
-            "watermark, dedupe, late data handling and checkpoints."
+            "watermark, dedupe, invalid quarantine and checkpoints."
         )
     )
     parser.add_argument(
@@ -89,12 +96,6 @@ def parse_args() -> argparse.Namespace:
         help="Watermark delay for event time dedupe (example: '2 days', '12 hours').",
     )
     parser.add_argument(
-        "--late-threshold-hours",
-        type=int,
-        default=48,
-        help="Events older than this threshold are flagged as late and sent to quarantine.",
-    )
-    parser.add_argument(
         "--max-files-per-trigger",
         type=int,
         default=50,
@@ -119,7 +120,7 @@ def read_usage_stream(spark: SparkSession, input_path: Path, max_files_per_trigg
     )
 
 
-def add_technical_columns(df: DataFrame, late_threshold_hours: int) -> DataFrame:
+def add_technical_columns(df: DataFrame) -> DataFrame:
     return (
         df.withColumn("ingest_ts", F.current_timestamp())
         .withColumn("source_file", F.input_file_name())
@@ -128,9 +129,8 @@ def add_technical_columns(df: DataFrame, late_threshold_hours: int) -> DataFrame
         .withColumn("batch_date", F.to_date("ingest_ts"))
         .withColumn("value_num", F.col("value").cast("double"))
         .withColumn(
-            "is_late",
-            F.col("event_ts")
-            < F.expr(f"current_timestamp() - INTERVAL {late_threshold_hours} HOURS"),
+            "is_value_cast_error",
+            F.col("value").isNotNull() & F.col("value_num").isNull(),
         )
     )
 
@@ -138,11 +138,9 @@ def add_technical_columns(df: DataFrame, late_threshold_hours: int) -> DataFrame
 def build_queries(df: DataFrame, args: argparse.Namespace):
     bronze_stream_path = args.bronze_root / "streaming" / "usage_events"
     invalid_path = args.bronze_root / "quarantine" / "usage_events_invalid"
-    late_path = args.bronze_root / "quarantine" / "usage_events_late"
 
     bronze_ckp = args.checkpoint_root / "streaming_landing_to_bronze" / "usage_events"
     invalid_ckp = args.checkpoint_root / "streaming_landing_to_bronze" / "usage_events_invalid"
-    late_ckp = args.checkpoint_root / "streaming_landing_to_bronze" / "usage_events_late"
 
     trigger_builder = {"once": True} if not args.continuous else {"processingTime": "30 seconds"}
 
@@ -150,23 +148,20 @@ def build_queries(df: DataFrame, args: argparse.Namespace):
         df.filter(F.col("_corrupt_record").isNull())
         .filter(F.col("event_id").isNotNull())
         .filter(F.col("event_ts").isNotNull())
+        .filter(~F.col("is_value_cast_error"))
     )
 
     invalid_events = df.filter(
         F.col("_corrupt_record").isNotNull()
         | F.col("event_id").isNull()
         | F.col("event_ts").isNull()
+        | F.col("is_value_cast_error")
     )
 
-    deduped = valid_events.withWatermark("event_ts", args.watermark_delay).dropDuplicates(
-        ["event_id"]
-    )
-
-    on_time = deduped.filter(~F.col("is_late"))
-    late_events = deduped.filter(F.col("is_late"))
+    deduped = valid_events.withWatermark("event_ts", args.watermark_delay).dropDuplicates(["event_id"])
 
     q_bronze = (
-        on_time.writeStream.format("parquet")
+        deduped.writeStream.format("parquet")
         .outputMode("append")
         .option("checkpointLocation", str(bronze_ckp))
         .partitionBy("event_date")
@@ -183,16 +178,7 @@ def build_queries(df: DataFrame, args: argparse.Namespace):
         .start(str(invalid_path))
     )
 
-    q_late = (
-        late_events.writeStream.format("parquet")
-        .outputMode("append")
-        .option("checkpointLocation", str(late_ckp))
-        .partitionBy("event_date")
-        .trigger(**trigger_builder)
-        .start(str(late_path))
-    )
-
-    return [q_bronze, q_invalid, q_late]
+    return [q_bronze, q_invalid]
 
 
 def main() -> int:
@@ -212,12 +198,17 @@ def main() -> int:
             input_path=args.input_path,
             max_files_per_trigger=args.max_files_per_trigger,
         )
-        staged_df = add_technical_columns(source_df, args.late_threshold_hours)
+        staged_df = add_technical_columns(source_df)
         queries = build_queries(staged_df, args)
 
+        usage_path = args.bronze_root / "streaming" / "usage_events"
+        invalid_path = args.bronze_root / "quarantine" / "usage_events_invalid"
+
         print(f"[INFO] Input stream: {args.input_path}")
-        print(f"[INFO] Bronze stream path: {args.bronze_root / 'streaming' / 'usage_events'}")
+        print(f"[INFO] Bronze stream path: {usage_path}")
+        print(f"[INFO] Quarantine invalid path: {invalid_path}")
         print(f"[INFO] Checkpoint root: {args.checkpoint_root}")
+        print(f"[INFO] Watermark delay: {args.watermark_delay}")
         print(
             "[INFO] Running mode: "
             + ("continuous" if args.continuous else "trigger once (batch-like)")
@@ -225,6 +216,27 @@ def main() -> int:
 
         for query in queries:
             query.awaitTermination()
+
+        if not args.continuous:
+            if has_parquet_data(usage_path):
+                usage_count = spark.read.parquet(str(usage_path)).count()
+                print(
+                    "[VERIFY] bronze/streaming/usage_events "
+                    f"total_rows={usage_count} "
+                    "(compare this value across reruns for idempotency)"
+                )
+            else:
+                print(f"[WARN] Verification skipped: no parquet data found at {usage_path}")
+
+            if has_parquet_data(invalid_path):
+                invalid_count = spark.read.parquet(str(invalid_path)).count()
+                print(
+                    "[VERIFY] bronze/quarantine/usage_events_invalid "
+                    f"total_rows={invalid_count} "
+                    "(compare this value across reruns for idempotency)"
+                )
+            else:
+                print(f"[VERIFY] bronze/quarantine/usage_events_invalid total_rows=0")
 
         print("[OK] Streaming -> Bronze completed.")
         return 0
