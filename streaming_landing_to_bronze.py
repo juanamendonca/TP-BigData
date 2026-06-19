@@ -104,7 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--continuous",
         action="store_true",
-        help="Keep query running continuously. Default runs trigger once and exits.",
+        help="Keep query running continuously. Default drains backlog with availableNow micro-batches.",
     )
     return parser.parse_args()
 
@@ -142,7 +142,7 @@ def build_queries(df: DataFrame, args: argparse.Namespace):
     bronze_ckp = args.checkpoint_root / "streaming_landing_to_bronze" / "usage_events"
     invalid_ckp = args.checkpoint_root / "streaming_landing_to_bronze" / "usage_events_invalid"
 
-    trigger_builder = {"once": True} if not args.continuous else {"processingTime": "30 seconds"}
+    trigger_builder = {"availableNow": True} if not args.continuous else {"processingTime": "30 seconds"}
 
     valid_events = (
         df.filter(F.col("_corrupt_record").isNull())
@@ -211,7 +211,7 @@ def main() -> int:
         print(f"[INFO] Watermark delay: {args.watermark_delay}")
         print(
             "[INFO] Running mode: "
-            + ("continuous" if args.continuous else "trigger once (batch-like)")
+            + ("continuous" if args.continuous else "availableNow micro-batches")
         )
 
         for query in queries:

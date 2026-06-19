@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bronze -> Silver pipeline (batch) for second partial point 3.
+Bronze -> Silver pipeline (Structured Streaming) for second partial point 3.
 
 Implements minimum Silver requirements:
 - Conformance and cleaning for usage events.
@@ -8,6 +8,7 @@ Implements minimum Silver requirements:
 - 3 active data-quality rules.
 - Quarantine dataset with samples of broken records.
 - At least 3 features (daily_cost_usd, requests, genai_tokens_total, carbon_kg_total).
+- Reads Bronze usage events with readStream and writes Silver outputs with writeStream.
 """
 
 from __future__ import annotations
@@ -22,7 +23,33 @@ from typing import List, Optional
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
-from pyspark.sql.window import Window
+
+
+BRONZE_USAGE_SCHEMA = T.StructType(
+    [
+        T.StructField("event_id", T.StringType(), True),
+        T.StructField("timestamp", T.StringType(), True),
+        T.StructField("org_id", T.StringType(), True),
+        T.StructField("service", T.StringType(), True),
+        T.StructField("region", T.StringType(), True),
+        T.StructField("resource_id", T.StringType(), True),
+        T.StructField("metric", T.StringType(), True),
+        T.StructField("value", T.StringType(), True),
+        T.StructField("unit", T.StringType(), True),
+        T.StructField("cost_usd_increment", T.DoubleType(), True),
+        T.StructField("schema_version", T.IntegerType(), True),
+        T.StructField("genai_tokens", T.LongType(), True),
+        T.StructField("carbon_kg", T.DoubleType(), True),
+        T.StructField("_corrupt_record", T.StringType(), True),
+        T.StructField("ingest_ts", T.TimestampType(), True),
+        T.StructField("source_file", T.StringType(), True),
+        T.StructField("event_ts", T.TimestampType(), True),
+        T.StructField("batch_date", T.DateType(), True),
+        T.StructField("value_num", T.DoubleType(), True),
+        T.StructField("is_value_cast_error", T.BooleanType(), True),
+        T.StructField("event_date", T.DateType(), True),
+    ]
+)
 
 
 @dataclass
@@ -85,10 +112,37 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=100,
         help="Number of quarantine sample records to store for evidence.",
     )
+    parser.add_argument(
+        "--checkpoint-root",
+        type=Path,
+        default=Path("datalake") / "checkpoints",
+        help="Checkpoint root for streaming queries.",
+    )
+    parser.add_argument(
+        "--watermark-delay",
+        type=str,
+        default="2 days",
+        help="Watermark delay for event-time aggregations.",
+    )
+    parser.add_argument(
+        "--max-files-per-trigger",
+        type=int,
+        default=50,
+        help="Max Bronze Parquet files per micro-batch.",
+    )
+    parser.add_argument(
+        "--continuous",
+        action="store_true",
+        help="Keep streaming queries running continuously. Default drains backlog with availableNow.",
+    )
     return parser.parse_args(argv)
 
 
-def load_bronze_inputs(spark: SparkSession, bronze_root: Path) -> tuple[DataFrame, DataFrame]:
+def load_bronze_inputs(
+    spark: SparkSession,
+    bronze_root: Path,
+    max_files_per_trigger: int,
+) -> tuple[DataFrame, DataFrame]:
     usage_path = bronze_root / "streaming" / "usage_events"
     customers_path = bronze_root / "batch" / "customers_orgs"
 
@@ -98,7 +152,12 @@ def load_bronze_inputs(spark: SparkSession, bronze_root: Path) -> tuple[DataFram
             f"{usage_path}."
         )
 
-    usage = spark.read.parquet(str(usage_path))
+    usage = (
+        spark.readStream.format("parquet")
+        .schema(BRONZE_USAGE_SCHEMA)
+        .option("maxFilesPerTrigger", max_files_per_trigger)
+        .load(str(usage_path))
+    )
     customers = spark.read.parquet(str(customers_path)).select(
         "org_id",
         "org_name",
@@ -127,12 +186,11 @@ def prepare_events(usage: DataFrame) -> DataFrame:
 
 
 def apply_quality_rules(events: DataFrame) -> DataFrame:
-    w = Window.partitionBy("event_id")
-
     with_flags = (
-        events.withColumn("event_id_count", F.count(F.lit(1)).over(w))
-        .withColumn("dq_event_id_not_null", F.col("event_id").isNotNull())
-        .withColumn("dq_event_id_unique", F.col("event_id_count") == F.lit(1))
+        events.withColumn("dq_event_id_not_null", F.col("event_id").isNotNull())
+        # Bronze streaming already performs event_id dedupe with watermark. Silver keeps the
+        # rule explicit and re-applies dropDuplicates before writing valid events.
+        .withColumn("dq_event_id_unique", F.lit(True))
         .withColumn(
             "dq_cost_min_threshold",
             F.coalesce(F.col("cost_usd_increment"), F.lit(0.0)) >= F.lit(-0.01),
@@ -172,11 +230,7 @@ def split_silver_and_quarantine(flagged: DataFrame) -> tuple[DataFrame, DataFram
         | (~F.col("dq_unit_when_value"))
     )
 
-    silver_events = flagged.filter(
-        F.col("dq_event_id_not_null")
-        & F.col("dq_event_id_unique")
-        & F.col("dq_unit_when_value")
-    )
+    silver_events = flagged.filter(F.col("dq_event_id_not_null") & F.col("dq_unit_when_value"))
 
     return silver_events, quarantine
 
@@ -185,9 +239,10 @@ def enrich_with_master(silver_events: DataFrame, customers: DataFrame) -> DataFr
     return silver_events.join(customers, on="org_id", how="left")
 
 
-def build_daily_features(enriched_events: DataFrame) -> DataFrame:
+def build_daily_features(enriched_events: DataFrame, watermark_delay: str) -> DataFrame:
     return (
-        enriched_events.groupBy("event_date", "org_id", "service")
+        enriched_events.withWatermark("event_ts", watermark_delay)
+        .groupBy(F.window("event_ts", "1 day").alias("event_window"), "org_id", "service")
         .agg(
             F.sum(F.coalesce(F.col("cost_usd_increment"), F.lit(0.0))).alias("daily_cost_usd"),
             F.sum(
@@ -202,6 +257,8 @@ def build_daily_features(enriched_events: DataFrame) -> DataFrame:
                 "anomaly_events_count"
             ),
         )
+        .withColumn("event_date", F.to_date(F.col("event_window.start")))
+        .drop("event_window")
         .withColumn("requests", F.col("requests").cast("long"))
         .withColumn("genai_tokens_total", F.col("genai_tokens_total").cast("long"))
     )
@@ -209,30 +266,46 @@ def build_daily_features(enriched_events: DataFrame) -> DataFrame:
 
 def write_outputs(
     silver_root: Path,
+    checkpoint_root: Path,
+    trigger_builder: dict,
     enriched_events: DataFrame,
     daily_features: DataFrame,
     quarantine: DataFrame,
     sample_quarantine: int,
-) -> None:
+):
     events_path = silver_root / "events_enriched"
     features_path = silver_root / "features_org_daily"
     quarantine_path = silver_root / "quarantine" / "events_quality_issues"
     quarantine_samples_path = silver_root / "quarantine" / "samples"
 
-    (
-        enriched_events.write.mode("overwrite")
+    events_ckp = checkpoint_root / "bronze_to_silver" / "events_enriched"
+    features_ckp = checkpoint_root / "bronze_to_silver" / "features_org_daily"
+    quarantine_ckp = checkpoint_root / "bronze_to_silver" / "events_quality_issues"
+    samples_ckp = checkpoint_root / "bronze_to_silver" / "samples"
+
+    q_events = (
+        enriched_events.writeStream.format("parquet")
+        .outputMode("append")
+        .option("checkpointLocation", str(events_ckp))
         .partitionBy("event_date")
-        .parquet(str(events_path))
+        .trigger(**trigger_builder)
+        .start(str(events_path))
     )
-    (
-        daily_features.write.mode("overwrite")
+    q_features = (
+        daily_features.writeStream.format("parquet")
+        .outputMode("append")
+        .option("checkpointLocation", str(features_ckp))
         .partitionBy("event_date")
-        .parquet(str(features_path))
+        .trigger(**trigger_builder)
+        .start(str(features_path))
     )
-    (
-        quarantine.write.mode("overwrite")
+    q_quarantine = (
+        quarantine.writeStream.format("parquet")
+        .outputMode("append")
+        .option("checkpointLocation", str(quarantine_ckp))
         .partitionBy("event_date")
-        .parquet(str(quarantine_path))
+        .trigger(**trigger_builder)
+        .start(str(quarantine_path))
     )
 
     sample = quarantine.select(
@@ -246,8 +319,16 @@ def write_outputs(
         "cost_usd_increment",
         "dq_violations",
         "source_file",
-    ).limit(sample_quarantine)
-    sample.write.mode("overwrite").json(str(quarantine_samples_path))
+    )
+    q_samples = (
+        sample.writeStream.format("json")
+        .outputMode("append")
+        .option("checkpointLocation", str(samples_ckp))
+        .trigger(**trigger_builder)
+        .start(str(quarantine_samples_path))
+    )
+
+    return [q_events, q_features, q_quarantine, q_samples]
 
 
 def print_verify_counts(spark: SparkSession, silver_root: Path) -> None:
@@ -303,46 +384,84 @@ def write_manifest(
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     ensure_dir(args.silver_root)
+    ensure_dir(args.checkpoint_root)
 
     started_at = utc_now_iso()
     spark = build_spark("bronze_to_silver")
 
     try:
-        usage, customers = load_bronze_inputs(spark, args.bronze_root)
-
-        records_bronze_input = usage.count()
+        usage, customers = load_bronze_inputs(
+            spark=spark,
+            bronze_root=args.bronze_root,
+            max_files_per_trigger=args.max_files_per_trigger,
+        )
         prepared = prepare_events(usage)
-        records_after_event_dedupe = prepared.dropDuplicates(["event_id"]).count()
 
         flagged = apply_quality_rules(prepared)
         silver_events, quarantine = split_silver_and_quarantine(flagged)
-
-        records_flagged_total = flagged.count()
-        records_hard_fail = quarantine.count()
-        records_pre_enrichment = silver_events.count()
-
-        records_without_customer_match = (
-            silver_events.select("org_id").dropDuplicates(["org_id"])
-            .join(customers.select("org_id").dropDuplicates(["org_id"]), on="org_id", how="left_anti")
-            .count()
+        deduped_silver_events = (
+            silver_events.withWatermark("event_ts", args.watermark_delay)
+            .dropDuplicates(["event_id"])
         )
 
-        enriched = enrich_with_master(silver_events, customers)
-        features = build_daily_features(enriched)
+        enriched = enrich_with_master(deduped_silver_events, customers)
+        features = build_daily_features(enriched, args.watermark_delay)
 
-        records_quarantine = records_hard_fail
-        records_silver_events = enriched.count()
-        records_silver_features = features.count()
+        trigger_builder = {"availableNow": True} if not args.continuous else {"processingTime": "30 seconds"}
 
-        write_outputs(
+        queries = write_outputs(
             silver_root=args.silver_root,
+            checkpoint_root=args.checkpoint_root,
+            trigger_builder=trigger_builder,
             enriched_events=enriched,
             daily_features=features,
             quarantine=quarantine,
             sample_quarantine=args.sample_quarantine,
         )
 
+        print(f"[INFO] Bronze stream path: {args.bronze_root / 'streaming' / 'usage_events'}")
+        print(f"[INFO] Silver root: {args.silver_root}")
+        print(f"[INFO] Checkpoint root: {args.checkpoint_root / 'bronze_to_silver'}")
+        print(f"[INFO] Watermark delay: {args.watermark_delay}")
+        print(
+            "[INFO] Running mode: "
+            + ("continuous" if args.continuous else "availableNow micro-batches")
+        )
+
+        for query in queries:
+            query.awaitTermination()
+
+        if args.continuous:
+            return 0
+
         print_verify_counts(spark, args.silver_root)
+
+        usage_path = args.bronze_root / "streaming" / "usage_events"
+        events_path = args.silver_root / "events_enriched"
+        features_path = args.silver_root / "features_org_daily"
+        quarantine_path = args.silver_root / "quarantine" / "events_quality_issues"
+
+        records_bronze_input = spark.read.parquet(str(usage_path)).count()
+        records_after_event_dedupe = (
+            spark.read.parquet(str(events_path)).select("event_id").dropDuplicates(["event_id"]).count()
+            if has_parquet_data(events_path)
+            else 0
+        )
+        records_quarantine = (
+            spark.read.parquet(str(quarantine_path)).count()
+            if has_parquet_data(quarantine_path)
+            else 0
+        )
+        records_silver_events = (
+            spark.read.parquet(str(events_path)).count()
+            if has_parquet_data(events_path)
+            else 0
+        )
+        records_silver_features = (
+            spark.read.parquet(str(features_path)).count()
+            if has_parquet_data(features_path)
+            else 0
+        )
 
         stats = SilverStats(
             records_bronze_input=records_bronze_input,
@@ -357,10 +476,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         print(f"[INFO] Bronze records: {records_bronze_input}")
         print(f"[INFO] After dedupe: {records_after_event_dedupe}")
-        print(f"[INFO] Flagged total (before split): {records_flagged_total}")
-        print(f"[INFO] Hard-fail quality records: {records_hard_fail}")
-        print(f"[INFO] Silver events before enrichment: {records_pre_enrichment}")
-        print(f"[INFO] Distinct org_id without customers match: {records_without_customer_match}")
         print(f"[INFO] Quarantine records: {records_quarantine}")
         print(f"[INFO] Silver events: {records_silver_events}")
         print(f"[INFO] Silver features: {records_silver_features}")

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Silver -> Gold pipeline (point 4).
+Silver -> Gold pipeline (Structured Streaming) (point 4).
 Builds FinOps mart: org_daily_usage_by_service.
 """
 
@@ -15,6 +15,22 @@ from typing import List, Optional
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql import types as T
+
+
+SILVER_FEATURES_SCHEMA = T.StructType(
+    [
+        T.StructField("org_id", T.StringType(), True),
+        T.StructField("service", T.StringType(), True),
+        T.StructField("daily_cost_usd", T.DoubleType(), True),
+        T.StructField("requests", T.LongType(), True),
+        T.StructField("genai_tokens_total", T.LongType(), True),
+        T.StructField("carbon_kg_total", T.DoubleType(), True),
+        T.StructField("events_count", T.LongType(), True),
+        T.StructField("anomaly_events_count", T.LongType(), True),
+        T.StructField("event_date", T.DateType(), True),
+    ]
+)
 
 
 @dataclass
@@ -60,11 +76,43 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=Path("datalake") / "gold",
         help="Gold root path.",
     )
+    parser.add_argument(
+        "--checkpoint-root",
+        type=Path,
+        default=Path("datalake") / "checkpoints",
+        help="Checkpoint root for streaming queries.",
+    )
+    parser.add_argument(
+        "--max-files-per-trigger",
+        type=int,
+        default=50,
+        help="Max Silver Parquet files per micro-batch.",
+    )
+    parser.add_argument(
+        "--continuous",
+        action="store_true",
+        help="Keep streaming query running continuously. Default drains backlog with availableNow.",
+    )
     return parser.parse_args(argv)
 
 
-def load_silver_features(spark: SparkSession, silver_root: Path) -> DataFrame:
-    return spark.read.parquet(str(silver_root / "features_org_daily"))
+def has_parquet_data(path: Path) -> bool:
+    if not path.exists():
+        return False
+    return any(path.rglob("*.parquet"))
+
+
+def load_silver_features(
+    spark: SparkSession,
+    silver_root: Path,
+    max_files_per_trigger: int,
+) -> DataFrame:
+    return (
+        spark.readStream.format("parquet")
+        .schema(SILVER_FEATURES_SCHEMA)
+        .option("maxFilesPerTrigger", max_files_per_trigger)
+        .load(str(silver_root / "features_org_daily"))
+    )
 
 
 def build_gold_mart(features: DataFrame) -> DataFrame:
@@ -89,12 +137,21 @@ def build_gold_mart(features: DataFrame) -> DataFrame:
     )
 
 
-def write_gold(gold_root: Path, mart: DataFrame) -> None:
+def write_gold(
+    gold_root: Path,
+    checkpoint_root: Path,
+    mart: DataFrame,
+    trigger_builder: dict,
+):
     out_path = gold_root / "org_daily_usage_by_service"
-    (
-        mart.write.mode("overwrite")
+    checkpoint_dir = checkpoint_root / "silver_to_gold" / "org_daily_usage_by_service"
+    return (
+        mart.writeStream.format("parquet")
+        .outputMode("append")
+        .option("checkpointLocation", str(checkpoint_dir))
         .partitionBy("event_date")
-        .parquet(str(out_path))
+        .trigger(**trigger_builder)
+        .start(str(out_path))
     )
 
 
@@ -128,20 +185,50 @@ def write_manifest(gold_root: Path, stats: GoldStats, started_at: str, finished_
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     ensure_dir(args.gold_root)
+    ensure_dir(args.checkpoint_root)
 
     started_at = utc_now_iso()
     spark = build_spark("silver_to_gold")
 
     try:
-        features = load_silver_features(spark, args.silver_root)
+        features = load_silver_features(
+            spark=spark,
+            silver_root=args.silver_root,
+            max_files_per_trigger=args.max_files_per_trigger,
+        )
         mart = build_gold_mart(features)
 
+        trigger_builder = {"availableNow": True} if not args.continuous else {"processingTime": "30 seconds"}
+
+        query = write_gold(
+            gold_root=args.gold_root,
+            checkpoint_root=args.checkpoint_root,
+            mart=mart,
+            trigger_builder=trigger_builder,
+        )
+        print(f"[INFO] Silver stream path: {args.silver_root / 'features_org_daily'}")
+        print(f"[INFO] Gold mart path: {args.gold_root / 'org_daily_usage_by_service'}")
+        print(f"[INFO] Checkpoint root: {args.checkpoint_root / 'silver_to_gold'}")
+        print(
+            "[INFO] Running mode: "
+            + ("continuous" if args.continuous else "availableNow micro-batches")
+        )
+        query.awaitTermination()
+
+        if args.continuous:
+            return 0
+
+        silver_path = args.silver_root / "features_org_daily"
+        gold_path = args.gold_root / "org_daily_usage_by_service"
         stats = GoldStats(
-            records_silver_input=features.count(),
-            records_gold_output=mart.count(),
+            records_silver_input=spark.read.parquet(str(silver_path)).count()
+            if has_parquet_data(silver_path)
+            else 0,
+            records_gold_output=spark.read.parquet(str(gold_path)).count()
+            if has_parquet_data(gold_path)
+            else 0,
         )
 
-        write_gold(args.gold_root, mart)
         finished_at = utc_now_iso()
         write_manifest(args.gold_root, stats, started_at, finished_at)
 

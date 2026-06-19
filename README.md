@@ -205,7 +205,7 @@ Script principal:
 
 ### Como correr Parte 2
 
-Modo recomendado para entrega (trigger once):
+Modo recomendado para entrega (availableNow, procesa backlog en micro-batches):
 
 ```powershell
 python streaming_landing_to_bronze.py --watermark-delay "2 days" --max-files-per-trigger 50
@@ -232,7 +232,7 @@ Script principal:
 
 ### Que hace el script
 
-- Lee eventos desde Bronze streaming y 1 maestro desde Bronze batch (`customers_orgs`).
+- Lee eventos desde Bronze streaming con `readStream` y 1 maestro desde Bronze batch (`customers_orgs`).
 - Aplica limpieza/conformance de tipos y campos (event_ts, value_num, metric, unit, costos).
 - Aplica join de enriquecimiento por `org_id` con datos de organizacion.
 - Activa reglas de calidad:
@@ -241,11 +241,13 @@ Script principal:
   - `cost_usd_increment >= -0.01` (se mantiene en Silver con `anomaly_cost_flag`).
   - `unit` no nulo cuando `value` existe.
 - Envia registros con fallas duras a quarantine y guarda muestras.
-- Genera features diarias por `event_date`, `org_id`, `service`:
+- Genera features diarias por `event_date`, `org_id`, `service` con agregacion streaming, watermark y ventana diaria:
   - `daily_cost_usd`
   - `requests`
   - `genai_tokens_total`
   - `carbon_kg_total`
+- Escribe Silver con `writeStream` en modo append y checkpoints:
+  - `datalake/checkpoints/bronze_to_silver/`
 
 ### Como correr Parte 3
 
@@ -268,6 +270,7 @@ python bronze_to_silver.py
 - Quarantine: `datalake/silver/quarantine/events_quality_issues/event_date=YYYY-MM-DD/`
 - Muestras de quarantine: `datalake/silver/quarantine/samples/`
 - Manifest: `datalake/silver/_control/manifest.json`
+- Checkpoints: `datalake/checkpoints/bronze_to_silver/`
 
 ## Parte 4: Silver -> Gold (PySpark)
 
@@ -276,7 +279,7 @@ Script principal:
 
 ### Que hace el script
 
-- Lee `datalake/silver/features_org_daily`.
+- Lee `datalake/silver/features_org_daily` con `readStream`.
 - Construye el mart FinOps `org_daily_usage_by_service` (grano diario por org/servicio).
 - Calcula y publica metricas/costos de negocio para serving:
   - `daily_cost_usd`
@@ -287,6 +290,8 @@ Script principal:
   - `anomaly_events_count`
   - `quality_score`
 - Agrega `month_bucket` para modelado query-first en Cassandra.
+- Escribe Gold con `writeStream` en modo append y checkpoint:
+  - `datalake/checkpoints/silver_to_gold/`
 
 ### Como correr Parte 4
 
@@ -306,6 +311,7 @@ python silver_to_gold.py
 
 - Gold mart: `datalake/gold/org_daily_usage_by_service/event_date=YYYY-MM-DD/`
 - Manifest: `datalake/gold/_control/manifest.json`
+- Checkpoint: `datalake/checkpoints/silver_to_gold/`
 
 ## Parte 5: Gold -> Serving (Cassandra en Docker)
 
@@ -394,7 +400,7 @@ Test-NetConnection -ComputerName 127.0.0.1 -Port 9042
 ### 1) Batch y Streaming ejecutan con datos provistos
 
 - Batch a Bronze ejecutado correctamente con conteos y manifest en `datalake/bronze/_control/batch_date=.../manifest.json`.
-- Streaming a Bronze ejecutado correctamente en modo trigger once, con salida en:
+- Streaming a Bronze ejecutado correctamente en modo availableNow con micro-batches, con salida en:
   - `datalake/bronze/streaming/usage_events/`
   - `datalake/bronze/quarantine/usage_events_invalid/`
   - Watermark activo para tolerancia de eventos tardios.
@@ -444,7 +450,7 @@ Resultado observado: `1 row`.
 
 - Al final de cada script (Parte 1, 2 y 3) se imprime `[VERIFY] <dataset> total_rows=<n>`.
 - Re-ejecutar con misma entrada y misma configuracion produce los mismos valores.
-- Bronze y Silver/Gold escriben en modo `overwrite` particionado.
+- Bronze streaming, Silver y Gold escriben con `writeStream` en modo `append`, particionado y con checkpoints.
 - Serving usa clave primaria por `((org_id, month_bucket), event_date, service)`, evitando duplicados logicos.
 
 ### 7) Diagnostico de diferencia Bronze vs Silver
@@ -481,3 +487,5 @@ Resultado observado: `1 row`.
 6) Decisiones de compatibilidad
 - PySpark fijado en version estable para entorno local.
 - Documentacion de ejecucion para Windows, Linux/macOS y Docker.
+- Escribe Silver con `writeStream` en modo append y checkpoints:
+  - `datalake/checkpoints/bronze_to_silver/`
