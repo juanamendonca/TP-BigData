@@ -1,491 +1,191 @@
-# TP-BigData - Segunda Entrega (MVP tecnico)
+# TP-BigData - Segunda Entrega (MVP técnico)
 
+Objetivo de la entrega: demostrar el flujo end-to-end (Landing -> Bronze -> Silver -> Gold -> Serving).
 
-Objetivo de la entrega: demostrar el flujo end-to-end(Landing -> Bronze -> Silver -> Gold -> Serving).
-
-## Instalacion global del TP
+## Instalación y Configuración
 
 ### Requisitos base
+* **Python 3.11.9** (Requerido: versiones 3.12+ presentan incompatibilidades con `cassandra-driver`).
+* **Java 11 o 17** (Requerido por Apache Spark).
 
-- Python 3.10+ (recomendado: usar el .venv del proyecto)
-- Java 11 o 17 (requerido por Spark)
+---
 
-### 1) Activar entorno virtual (Windows PowerShell)
+### Paso 1 — Crear y Activar Entorno Virtual (.venv)
 
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
-.\.venv\Scripts\Activate.ps1
-```
+Ejecutá según tu sistema operativo en la carpeta raíz del proyecto:
 
-### 2) Instalar dependencias base
+* **Windows (PowerShell):**
+  ```powershell
+  # 1. Crear entorno con Python 3.11
+  py -3.11 -m venv .venv
 
-```powershell
-python -m pip install --upgrade pip
-python -m pip install pyspark==3.5.2
-```
+  # 2. Activar entorno (ejecutar antes 'Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned' si da error)
+  .\.venv\Scripts\Activate.ps1
+  ```
+* **macOS / Linux:**
+  ```bash
+  # 1. Crear entorno con Python 3.11
+  python3.11 -m venv .venv
 
-### 3) Verificar instalacion
+  # 2. Activar entorno
+  source .venv/bin/activate
+  ```
 
-```powershell
-python -m pip show pyspark
-java -version
-```
+---
 
-Version recomendada para Windows en este TP:
-- pyspark 3.5.2
-- Java 17 (preferido) o Java 11
-
-### Instalacion global en Linux/macOS
-
-1) Crear y activar entorno virtual:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-2) Instalar dependencias base:
-
+### Paso 2 — Instalar todas las dependencias
+Con el entorno virtual activado, actualizá pip e instalá todos los paquetes (`pyspark`, `cassandra-driver` y `gevent` se instalan juntos aquí):
 ```bash
 python -m pip install --upgrade pip
-python -m pip install pyspark==3.5.2
+python -m pip install -r requirements.txt
 ```
 
-3) Instalar Java 17:
+---
 
-Linux (Ubuntu/Debian):
+### Paso 3 — Instalar Java 17 y Configurar Variables de Entorno
+Para que Spark pueda correr en modo local, es necesario configurar las rutas de Java y las utilidades de Hadoop (winutils):
 
-```bash
-sudo apt update
-sudo apt install -y openjdk-17-jdk
-```
+* **Windows (PowerShell):**
+  Descargá e instalá JDK 17 (Microsoft JDK, Temurin o similar) y ejecutá en tu terminal:
+  ```powershell
+  # Java 17 (Ajustá la versión de la carpeta según tu JDK instalado)
+  $env:JAVA_HOME = "C:\Program Files\Microsoft\jdk-17.0.19.10-hotspot"
+  $env:Path = "$env:JAVA_HOME\bin;" + $env:Path
 
-macOS (Homebrew):
+  # Hadoop / winutils (Requerido por Spark para Windows)
+  $env:HADOOP_HOME = "$PWD\hadoop"
+  $env:Path = "$env:HADOOP_HOME\bin;" + $env:Path
+  ```
+* **macOS / Linux:**
+  - **macOS (Homebrew):**
+    ```bash
+    brew install openjdk@17
+    export JAVA_HOME=$(/usr/libexec/java_home -v 17)
+    export PATH="$JAVA_HOME/bin:$PATH"
+    ```
+  - **Linux (Ubuntu/Debian):**
+    ```bash
+    sudo apt update && sudo apt install -y openjdk-17-jdk
+    export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+    export PATH="$JAVA_HOME/bin:$PATH"
+    ```
 
-```bash
-brew install openjdk@17
-```
+---
 
-4) Exportar JAVA_HOME en la sesion actual:
-
-Linux:
-
-```bash
-export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
-export PATH="$JAVA_HOME/bin:$PATH"
-```
-
-macOS:
-
-```bash
-export JAVA_HOME=$(/usr/libexec/java_home -v 17)
-export PATH="$JAVA_HOME/bin:$PATH"
-```
-
-5) Verificar instalacion:
-
+### Paso 4 — Verificar la instalación
+Corré estos comandos para asegurar que la configuración está lista:
 ```bash
 python -m pip show pyspark
 java -version
 ```
 
-## Parte 1: Batch -> Bronze (PySpark)
+---
 
-Script principal:
-- batch_landing_to_bronze.py
+## Guía de Ejecución del Pipeline (Paso a Paso)
 
-### Que hace el script
+Asegurate de estar posicionado en la carpeta raíz del proyecto, con el entorno virtual activado y las variables de entorno configuradas antes de continuar.
 
-- Lee maestros CSV desde datalake/landing con esquema explicito (sin inferencia).
-- Aplica deduplicacion por claves de negocio por tabla.
-- Agrega columnas tecnicas:
-  - ingest_ts
-  - source_file
-  - batch_date
-- Deriva columnas temporales para particionado natural cuando aplica:
-  - created_date = to_date(created_at) en support_tickets
-  - touch_date = to_date(timestamp) en marketing_touches
-- Escribe Bronze en formato Parquet con particionado sensato por tabla:
-  - billing_monthly: month
-  - support_tickets: created_date
-  - marketing_touches: touch_date
-  - customers_orgs y users: load_date
-  - nps_surveys: survey_date
-  - resources: batch_date
-- Aplica controles basicos de calidad: filtro NOT NULL sobre claves criticas.
-- Genera manifest de control con conteos de lectura, post-calidad, post-dedupe y escritura.
-- Es idempotente por particion: reescribe las particiones objetivo del lote ejecutado.
+---
 
-Tablas soportadas:
-- billing_monthly
-- customers_orgs
-- marketing_touches
-- nps_surveys
-- resources
-- support_tickets
-- users
-
-## Como correr Parte 1
-
-### Ejecucion (3 tablas)
-
-```powershell
-python batch_landing_to_bronze.py --batch-date 2026-06-15 --tables customers_orgs,users,billing_monthly
-```
-
-### Ejecucion completa (todos las tablas)
-
-```powershell
-python batch_landing_to_bronze.py --batch-date 2026-06-15
-```
-
-### Ejecucion en Linux/macOS
-
-Batch (3 tablas):
-
-```bash
-python batch_landing_to_bronze.py --batch-date 2026-06-15 --tables customers_orgs,users,billing_monthly
-```
-
-Batch completo:
-
+### Paso 1 — Ingesta Batch a Bronze (Maestros)
+Procesa los archivos maestros desde `datalake/landing` hacia `datalake/bronze`:
 ```bash
 python batch_landing_to_bronze.py --batch-date 2026-06-15
 ```
+*(Opcional: podés especificar tablas separadas por comas con `--tables customers_orgs,users`).*
 
-### Parametros disponibles
+---
 
-- --landing-root: ruta de entrada (default: datalake/landing)
-- --bronze-root: ruta de salida (default: datalake/bronze)
-- --batch-date: fecha de particion en formato YYYY-MM-DD
-- --tables: lista separada por comas con tablas a procesar (minimo 3)
-
-## Salidas esperadas
-
-Parquet Bronze por tabla:
-- billing_monthly: datalake/bronze/batch/billing_monthly/month=YYYY-MM-DD/
-- support_tickets: datalake/bronze/batch/support_tickets/created_date=YYYY-MM-DD/
-- marketing_touches: datalake/bronze/batch/marketing_touches/touch_date=YYYY-MM-DD/
-- customers_orgs: datalake/bronze/batch/customers_orgs/load_date=YYYY-MM-DD/
-- users: datalake/bronze/batch/users/load_date=YYYY-MM-DD/
-- nps_surveys: datalake/bronze/batch/nps_surveys/survey_date=YYYY-MM-DD/
-- resources: datalake/bronze/batch/resources/batch_date=YYYY-MM-DD/
-
-Manifest de corrida:
-- datalake/bronze/_control/batch_date=YYYY-MM-DD/manifest.json
-
-## Evidencia de cumplimiento (Batch -> Bronze)
-
-- Formato Bronze: Parquet particionado.
-- Particionado sensato por tabla segun patron de consulta.
-- Tipificacion: esquema explicito por cada CSV.
-- Trazabilidad: ingest_ts y source_file.
-- Calidad minima en Bronze: filtros NOT NULL para claves de negocio.
-- Dedupe: dropDuplicates por clave definida por tabla.
-- Idempotencia: overwrite dinamico por la columna de particion de cada tabla.
-
-## Parte 2: Streaming -> Bronze (PySpark Structured Streaming)
-
-Script principal:
-- streaming_landing_to_bronze.py
-
-### Que hace el script
-
-- Lee usage_events_stream/*.jsonl con Structured Streaming.
-- Usa esquema explicito unificado para schema_version 1 y 2.
-- Aplica withWatermark sobre event_ts para tolerancia de eventos tardios.
-- Aplica dedupe por event_id.
-- Envia a quarantine registros invalidos (corruptos, event_id/event_ts nulos y errores de casteo de value).
-- Habilita checkpointing para tolerancia a reinicios.
-- Agrega columnas tecnicas:
-  - ingest_ts
-  - source_file
-  - batch_date
-- Escribe Parquet particionado por event_date.
-
-### Como correr Parte 2
-
-Modo recomendado para entrega (availableNow, procesa backlog en micro-batches):
-
-```powershell
+### Paso 2 — Ingesta Streaming a Bronze (Eventos de uso)
+Lee incrementalmente los eventos de uso y genera la capa Bronze con watermarks:
+```bash
 python streaming_landing_to_bronze.py --watermark-delay "2 days" --max-files-per-trigger 50
 ```
 
-Modo continuo (simulacion near real-time):
+---
 
-```powershell
-python streaming_landing_to_bronze.py --continuous --watermark-delay "2 days"
-```
-
-En Linux/macOS usar los mismos comandos en shell bash/zsh.
-
-### Salidas esperadas Parte 2
-
-- Bronze streaming: datalake/bronze/streaming/usage_events/event_date=YYYY-MM-DD/
-- Quarantine invalidos: datalake/bronze/quarantine/usage_events_invalid/batch_date=YYYY-MM-DD/
-- Checkpoints: datalake/checkpoints/streaming_landing_to_bronze/
-
-## Parte 3: Bronze -> Silver (PySpark)
-
-Script principal:
-- bronze_to_silver.py
-
-### Que hace el script
-
-- Lee eventos desde Bronze streaming con `readStream` y 1 maestro desde Bronze batch (`customers_orgs`).
-- Aplica limpieza/conformance de tipos y campos (event_ts, value_num, metric, unit, costos).
-- Aplica join de enriquecimiento por `org_id` con datos de organizacion.
-- Activa reglas de calidad:
-  - `event_id` no nulo.
-  - `event_id` unico.
-  - `cost_usd_increment >= -0.01` (se mantiene en Silver con `anomaly_cost_flag`).
-  - `unit` no nulo cuando `value` existe.
-- Envia registros con fallas duras a quarantine y guarda muestras.
-- Genera features diarias por `event_date`, `org_id`, `service` con agregacion streaming, watermark y ventana diaria:
-  - `daily_cost_usd`
-  - `requests`
-  - `genai_tokens_total`
-  - `carbon_kg_total`
-- Escribe Silver con `writeStream` en modo append y checkpoints:
-  - `datalake/checkpoints/bronze_to_silver/`
-
-### Como correr Parte 3
-
-Windows PowerShell:
-
-```powershell
-python bronze_to_silver.py
-```
-
-Linux/macOS:
-
+### Paso 3 — Conformance y Enriquecimiento a Silver
+Limpia los tipos de datos, aplica reglas de calidad, maneja la cuarentena y genera features diarias:
 ```bash
-python bronze_to_silver.py
+python bronze_to_silver.py --max-files-per-trigger 1000
 ```
 
-### Salidas esperadas Parte 3
+---
 
-- Silver enriquecido: `datalake/silver/events_enriched/event_date=YYYY-MM-DD/`
-- Silver features: `datalake/silver/features_org_daily/event_date=YYYY-MM-DD/`
-- Quarantine: `datalake/silver/quarantine/events_quality_issues/event_date=YYYY-MM-DD/`
-- Muestras de quarantine: `datalake/silver/quarantine/samples/`
-- Manifest: `datalake/silver/_control/manifest.json`
-- Checkpoints: `datalake/checkpoints/bronze_to_silver/`
-
-## Parte 4: Silver -> Gold (PySpark)
-
-Script principal:
-- silver_to_gold.py
-
-### Que hace el script
-
-- Lee `datalake/silver/features_org_daily` con `readStream`.
-- Construye el mart FinOps `org_daily_usage_by_service` (grano diario por org/servicio).
-- Calcula y publica metricas/costos de negocio para serving:
-  - `daily_cost_usd`
-  - `requests`
-  - `genai_tokens_total`
-  - `carbon_kg_total`
-  - `events_count`
-  - `anomaly_events_count`
-  - `quality_score`
-- Agrega `month_bucket` para modelado query-first en Cassandra.
-- Escribe Gold con `writeStream` en modo append y checkpoint:
-  - `datalake/checkpoints/silver_to_gold/`
-
-### Como correr Parte 4
-
-Windows PowerShell:
-
-```powershell
-python silver_to_gold.py
-```
-
-Linux/macOS:
-
+### Paso 4 — Construcción del Mart a Gold
+Construye el mart de negocio FinOps agrupado a partir de las features agregadas:
 ```bash
-python silver_to_gold.py
+python silver_to_gold.py --max-files-per-trigger 1000
 ```
 
-### Salidas esperadas Parte 4
+---
 
-- Gold mart: `datalake/gold/org_daily_usage_by_service/event_date=YYYY-MM-DD/`
-- Manifest: `datalake/gold/_control/manifest.json`
-- Checkpoint: `datalake/checkpoints/silver_to_gold/`
+### Paso 5 — Carga al Serving (Cassandra / AstraDB)
 
-## Parte 5: Gold -> Serving (Cassandra en Docker)
+Este paso requiere tener una base de datos activa. Elegí una de las siguientes opciones para configurar tu entorno y correr el script:
 
-Script principal:
-- gold_to_serving_cassandra.py
+#### Opción A — AstraDB en la Nube (Recomendada)
+1. **Crear base de datos:** Registrate en [astra.datastax.com](https://astra.datastax.com) y creá una base de datos Serverless con keyspace `finops`.
+2. **Descargar Secure Connect Bundle:** Entrá a tu DB en el dashboard de Astra, ve a **Connect** > **Drivers** > **Python**, descargá el archivo ZIP `secure-connect-<db-name>.zip` y pegalo en la carpeta raíz del proyecto.
+3. **Generar Token:** En el panel de Astra ve a **Settings** > **Application Tokens** y generá un token con el rol **Database Administrator**. Copiá el token (formato: `AstraCS:...`).
+4. **Configurar archivo:** Copiá el template de configuración:
+   - *Windows:* `copy cassandra_config.example.json cassandra_config.json`
+   - *macOS/Linux:* `cp cassandra_config.example.json cassandra_config.json`
+   
+   Editá `cassandra_config.json` con tu ZIP y token:
+   ```json
+   {
+     "mode": "astradb",
+     "astradb": {
+       "bundle": "secure-connect-bigdata-tp.zip",
+       "token": "AstraCS:xxxxxxx...",
+       "keyspace": "finops",
+       "table": "org_daily_usage_by_service"
+     }
+   }
+   ```
+5. **Cargar y verificar:** Ejecutá la carga:
+   ```bash
+   python gold_to_serving_cassandra.py --write-serving --config cassandra_config.json
+   ```
+   Verificá los resultados en la **CQL Console** de la web de Astra ejecutando las consultas en `cql/02_queries_finops.cql`.
 
-Archivos CQL:
-- `cql/01_schema_finops.cql`
-- `cql/02_queries_finops.cql`
+#### Opción B — Cassandra Local con Docker
+1. **Levantar contenedor:** Teniendo Docker Desktop abierto, ejecutá:
+   ```bash
+   docker run -d --name cassandra-local -p 9042:9042 cassandra:4.1
+   ```
+2. **Esperar inicio:** Esperá a que el contenedor esté listo (~30-60 segundos):
+   - *Windows:* `docker logs cassandra-local 2>&1 | Select-String "Startup complete"`
+   - *macOS/Linux:* `docker logs cassandra-local 2>&1 | grep "Startup complete"`
+3. **Configurar archivo:** Copiá el template de configuración (`cassandra_config.json`) y cambiá el modo a local:
+   ```json
+   {
+     "mode": "local",
+     "local": {
+       "host": "127.0.0.1",
+       "port": 9042,
+       "keyspace": "finops",
+       "table": "org_daily_usage_by_service"
+     }
+   }
+   ```
+4. **Cargar y verificar:** Ejecutá la carga:
+   ```bash
+   python gold_to_serving_cassandra.py --write-serving --config cassandra_config.json
+   ```
+   Para validar localmente, conectate a cqlsh:
+   ```bash
+   docker exec -it cassandra-local cqlsh
+   # Dentro de cqlsh:
+   USE finops;
+   SELECT * FROM org_daily_usage_by_service LIMIT 10;
+   ```
 
-### Que hace el script
+---
 
-- Lee el mart Gold `org_daily_usage_by_service`.
-- Genera CQL de schema y 2 consultas minimas (query-first).
-- En modo dry-run valida conteos y deja artefactos CQL.
-- En modo `--write-serving` inserta datos en Cassandra usando `cassandra-driver`.
+## 📖 Arquitectura y Detalles del Diseño
 
-### Dependencia adicional para Parte 5
+Para leer en detalle el comportamiento de cada script, las salidas esperadas en disco, la validación de las reglas de calidad y el log con las decisiones de diseño arquitectónico de cada capa, consultá la documentación técnica:
 
-```powershell
-python -m pip install cassandra-driver
-```
-
-Linux/macOS:
-
-```bash
-python -m pip install cassandra-driver
-```
-
-### Setup Cassandra local con Docker
-
-```bash
-docker run -d --name cassandra-local -p 9042:9042 cassandra:4.1
-```
-
-Esperar ~30 segundos hasta que el nodo este listo, luego verificar:
-
-```bash
-docker exec -it cassandra-local cqlsh
-```
-
-Cargar schema (dentro de cqlsh):
-
-```sql
-SOURCE '/path/to/cql/01_schema_finops.cql';
-```
-
-O copiando el contenido de `cql/01_schema_finops.cql` directamente.
-
-### Como correr Parte 5
-
-Generar CQL + validar datos Gold (sin cargar):
-
-```powershell
-python gold_to_serving_cassandra.py
-```
-
-Carga real a Cassandra (ejemplo local):
-
-```powershell
-python gold_to_serving_cassandra.py --write-serving --host 127.0.0.1 --port 9042 --keyspace finops --table org_daily_usage_by_service
-```
-
-Verificar conectividad antes de cargar:
-
-Linux/macOS/WSL:
-
-```bash
-nc -zv 127.0.0.1 9042
-```
-
-Windows PowerShell:
-
-```powershell
-Test-NetConnection -ComputerName 127.0.0.1 -Port 9042
-```
-
-### Salidas esperadas Parte 5
-
-- CQL schema: `cql/01_schema_finops.cql`
-- CQL queries: `cql/02_queries_finops.cql`
-- Tabla poblada: `finops.org_daily_usage_by_service`
-
-## Evidencias de aceptacion
-
-### 1) Batch y Streaming ejecutan con datos provistos
-
-- Batch a Bronze ejecutado correctamente con conteos y manifest en `datalake/bronze/_control/batch_date=.../manifest.json`.
-- Streaming a Bronze ejecutado correctamente en modo availableNow con micro-batches, con salida en:
-  - `datalake/bronze/streaming/usage_events/`
-  - `datalake/bronze/quarantine/usage_events_invalid/`
-  - Watermark activo para tolerancia de eventos tardios.
-
-### 2) Reglas de calidad y quarantine efectivas
-
-- Silver aplica reglas de calidad activas (event_id, costo minimo, unit when value).
-- Manifest Silver generado en `datalake/silver/_control/manifest.json`.
-- Se valida que el pipeline completa y publica datasets Silver:
-  - `datalake/silver/events_enriched/`
-  - `datalake/silver/features_org_daily/`
-  - `datalake/silver/quarantine/events_quality_issues/`
-
-### 3) Mart FinOps en Gold
-
-- Mart `org_daily_usage_by_service` generado en `datalake/gold/org_daily_usage_by_service/`.
-- Manifest Gold en `datalake/gold/_control/manifest.json`.
-
-### 4) Serving en Cassandra poblado
-
-- Carga a Cassandra realizada con resultado exitoso:
-  - `Rows written to Cassandra: 11050`
-- Tabla de serving: `finops.org_daily_usage_by_service`.
-
-### 5) Consultas minimas sobre Cassandra
-
-- Query #1 (particion completa por org + month_bucket) devuelve multiples filas:
-
-```sql
-SELECT * FROM finops.org_daily_usage_by_service
-WHERE org_id = 'org_xaji0y6d' AND month_bucket = '2025-07';
-```
-
-Resultado observado: `38 rows`.
-
-- Query #2 (drill-down por org + mes + fecha + servicio) devuelve una fila puntual:
-
-```sql
-SELECT * FROM finops.org_daily_usage_by_service
-WHERE org_id = 'org_xaji0y6d' AND month_bucket = '2025-07'
-AND event_date = '2025-07-31' AND service = 'compute';
-```
-
-Resultado observado: `1 row`.
-
-### 6) Idempotencia verificada con [VERIFY]
-
-- Al final de cada script (Parte 1, 2 y 3) se imprime `[VERIFY] <dataset> total_rows=<n>`.
-- Re-ejecutar con misma entrada y misma configuracion produce los mismos valores.
-- Bronze streaming, Silver y Gold escriben con `writeStream` en modo `append`, particionado y con checkpoints.
-- Serving usa clave primaria por `((org_id, month_bucket), event_date, service)`, evitando duplicados logicos.
-
-### 7) Diagnostico de diferencia Bronze vs Silver
-
-- Silver imprime `Silver events before enrichment` y `Distinct org_id without customers match`.
-- Permite explicar cualquier diferencia entre registros Bronze (43200) y Silver events (41162) sin ambiguedad.
-
-## Log de decisiones
-
-1) Patron de arquitectura
-- Se mantiene Lambda segun 1er parcial: flujo batch para maestros y flujo streaming para eventos.
-
-2) Formatos por zona
-- Bronze/Silver/Gold en Parquet particionado para eficiencia y trazabilidad.
-
-3) Criterio de particionado
-- Bronze batch (por tabla):
-  - billing_monthly: month
-  - customers_orgs: load_date
-  - users: load_date
-  - marketing_touches: touch_date
-  - support_tickets: created_date
-  - nps_surveys: survey_date
-  - resources: batch_date
-- Bronze streaming: `event_date`.
-- Silver y Gold: `event_date`.
-
-4) Calidad de datos
-- En Silver se aplican reglas hard-fail a quarantine y reglas soft-fail con flag de anomalia.
-
-5) Modelo de serving (query-first)
-- Cassandra modelado para consultas por organizacion y mes (`org_id`, `month_bucket`) y drill-down por fecha/servicio.
-
-6) Decisiones de compatibilidad
-- PySpark fijado en version estable para entorno local.
-- Documentacion de ejecucion para Windows, Linux/macOS y Docker.
-- Escribe Silver con `writeStream` en modo append y checkpoints:
-  - `datalake/checkpoints/bronze_to_silver/`
+👉 **[DETALLES.md](file:///c:/Users/solro/TP-BigData/DETALLES.md)**

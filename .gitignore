@@ -12,3 +12,7 @@ __pycache__/
 
 # Ignore generated text extracts from partials
 *parcial*.txt
+
+# Cassandra credentials (usar cassandra_config.example.json como template)
+cassandra_config.json
+secure-connect-*.zip

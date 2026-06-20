@@ -85,10 +85,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default="org_daily_usage_by_service",
         help="Cassandra table name.",
     )
-    parser.add_argument("--host", type=str, default=None, help="Cassandra host.")
-    parser.add_argument("--port", type=int, default=9042, help="Cassandra native transport port.")
-    parser.add_argument("--username", type=str, default=None, help="Cassandra username.")
-    parser.add_argument("--password", type=str, default=None, help="Cassandra password.")
+    parser.add_argument("--host", type=str, default=None, help="Cassandra host (local mode).")
+    parser.add_argument("--port", type=int, default=9042, help="Cassandra native transport port (local mode).")
+    parser.add_argument("--username", type=str, default=None, help="Cassandra username (local mode).")
+    parser.add_argument("--password", type=str, default=None, help="Cassandra password (local mode).")
+    parser.add_argument(
+        "--astradb-bundle",
+        type=str,
+        default=None,
+        help="Path to AstraDB secure connect bundle ZIP (AstraDB cloud mode).",
+    )
+    parser.add_argument(
+        "--astradb-token",
+        type=str,
+        default=None,
+        help="AstraDB application token starting with 'AstraCS:...' (AstraDB cloud mode).",
+    )
     parser.add_argument(
         "--write-serving",
         action="store_true",
@@ -105,7 +117,46 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Keep streaming query running continuously. Default runs trigger once and exits.",
     )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to cassandra_config.json (see cassandra_config.example.json). "
+             "Overrides defaults; explicit CLI args override config file.",
+    )
     return parser.parse_args(argv)
+
+
+def load_config(config_path: str, args: argparse.Namespace) -> argparse.Namespace:
+    """
+    Reads cassandra_config.json and fills in args fields that were not
+    explicitly set via CLI (i.e., still at their default None/False values).
+    Explicit CLI args always take precedence over the config file.
+    """
+    import json
+    with open(config_path) as f:
+        cfg = json.load(f)
+
+    mode = cfg.get("mode", "local")
+    section = cfg.get(mode, {})
+
+    if mode == "astradb":
+        if args.astradb_bundle is None:
+            args.astradb_bundle = section.get("bundle")
+        if args.astradb_token is None:
+            args.astradb_token = section.get("token")
+    else:
+        if args.host is None:
+            args.host = section.get("host", "127.0.0.1")
+        if args.port == 9042:  # default value — safe to override
+            args.port = section.get("port", 9042)
+
+    if args.keyspace == "finops":  # default value
+        args.keyspace = section.get("keyspace", "finops")
+    if args.table == "org_daily_usage_by_service":  # default value
+        args.table = section.get("table", "org_daily_usage_by_service")
+
+    return args
 
 
 def generate_cql_files(cql_dir: Path, keyspace: str, table: str) -> None:
@@ -156,33 +207,47 @@ def is_port_open(host: str, port: int, timeout_sec: float = 2.0) -> bool:
         return False
 
 
-def initialize_cassandra_schema(host: str, port: int, username: Optional[str], password: Optional[str], keyspace: str, table: str) -> None:
-    """
-    Initializes/verifies Keyspace and Table schema exactly ONCE on the Spark Driver
-    prior to starting the Structured Streaming process.
-    This avoids redundant DDL statements being executed on individual executors or per partition.
-    """
+def _build_cluster(host, port, username, password, astradb_bundle=None, astradb_token=None):
     from cassandra.cluster import Cluster
     from cassandra.auth import PlainTextAuthProvider
 
-    auth_provider = None
-    if username and password:
-        auth_provider = PlainTextAuthProvider(username=username, password=password)
+    if astradb_bundle:
+        auth_provider = PlainTextAuthProvider("token", astradb_token)
+        return Cluster(cloud={"secure_connect_bundle": astradb_bundle}, auth_provider=auth_provider)
+    else:
+        auth_provider = None
+        if username and password:
+            auth_provider = PlainTextAuthProvider(username=username, password=password)
+        return Cluster([host], port=port, auth_provider=auth_provider)
 
-    cluster = Cluster([host], port=port, auth_provider=auth_provider)
+
+def initialize_cassandra_schema(host: Optional[str], port: int, username: Optional[str], password: Optional[str],
+                               keyspace: str, table: str,
+                               astradb_bundle: Optional[str] = None, astradb_token: Optional[str] = None) -> None:
+    """
+    Initializes/verifies Keyspace and Table schema exactly ONCE on the Spark Driver
+    prior to starting the Structured Streaming process.
+
+    - Local mode: creates keyspace + table if they don't exist.
+    - AstraDB mode: keyspace must exist (created via Astra console); only creates the table.
+    """
+    cluster = _build_cluster(host, port, username, password, astradb_bundle, astradb_token)
     session = cluster.connect()
 
     print(f"[INFO] Initializing schema '{keyspace}.{table}' on Cassandra endpoint...")
-    session.execute(
-        f"""
-        CREATE KEYSPACE IF NOT EXISTS {keyspace}
-        WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': 1}}
-        """
-    )
 
+    if not astradb_bundle:
+        session.execute(
+            f"""
+            CREATE KEYSPACE IF NOT EXISTS {keyspace}
+            WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': 1}}
+            """
+        )
+
+    session.set_keyspace(keyspace)
     session.execute(
         f"""
-        CREATE TABLE IF NOT EXISTS {keyspace}.{table} (
+        CREATE TABLE IF NOT EXISTS {table} (
             org_id text,
             month_bucket text,
             event_date date,
@@ -203,24 +268,17 @@ def initialize_cassandra_schema(host: str, port: int, username: Optional[str], p
     cluster.shutdown()
 
 
-def build_partition_writer(host: str, port: int, username: Optional[str], password: Optional[str], keyspace: str, table: str):
+def build_partition_writer(host: Optional[str], port: int, username: Optional[str], password: Optional[str],
+                           keyspace: str, table: str,
+                           astradb_bundle: Optional[str] = None, astradb_token: Optional[str] = None):
     """
     Creates a serialized closure function that will run on Spark Executors
     to write a single partition of a micro-batch into Cassandra.
-    
-    Optimizations:
-    - Connects directly to the keyspace ('cluster.connect(keyspace)'), simplifying queries.
-    - Excludes DDL initialization logic entirely to keep execution focused only on write E/S.
+
+    Supports both local (host/port) and AstraDB cloud (bundle/token) modes.
     """
     def write_partition(rows):
-        from cassandra.cluster import Cluster
-        from cassandra.auth import PlainTextAuthProvider
-
-        auth_provider = None
-        if username and password:
-            auth_provider = PlainTextAuthProvider(username=username, password=password)
-
-        cluster = Cluster([host], port=port, auth_provider=auth_provider)
+        cluster = _build_cluster(host, port, username, password, astradb_bundle, astradb_token)
         # Connect directly to the specific keyspace
         session = cluster.connect(keyspace)
 
@@ -264,6 +322,13 @@ def build_partition_writer(host: str, port: int, username: Optional[str], passwo
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
+    if args.config:
+        if not Path(args.config).exists():
+            print(f"[ERROR] Config file not found: {args.config}")
+            return 2
+        args = load_config(args.config, args)
+        print(f"[INFO] Loaded config from: {args.config}")
+
     generate_cql_files(args.cql_dir, args.keyspace, args.table)
     print(f"[INFO] CQL generated: {args.cql_dir / '01_schema_finops.cql'}")
     print(f"[INFO] CQL generated: {args.cql_dir / '02_queries_finops.cql'}")
@@ -297,12 +362,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[INFO] Gold stream schema: {gold_stream_df.schema}")
             return 0
 
-        if not args.host:
-            raise ValueError("--host is required when --write-serving is enabled.")
-
-        if not is_port_open(args.host, args.port):
-            print(f"[ERROR] Cannot connect to Cassandra endpoint {args.host}:{args.port}.")
-            return 2
+        using_astra = bool(args.astradb_bundle)
+        if using_astra:
+            if not args.astradb_token:
+                raise ValueError("--astradb-token is required when --astradb-bundle is provided.")
+            if not Path(args.astradb_bundle).exists():
+                raise FileNotFoundError(f"Secure connect bundle not found: {args.astradb_bundle}")
+            print(f"[INFO] AstraDB mode: bundle={args.astradb_bundle}")
+        else:
+            if not args.host:
+                raise ValueError("Either --host (local mode) or --astradb-bundle (AstraDB mode) is required with --write-serving.")
+            if not is_port_open(args.host, args.port):
+                print(f"[ERROR] Cannot connect to Cassandra endpoint {args.host}:{args.port}. Is Docker running?")
+                return 2
+            print(f"[INFO] Local mode: {args.host}:{args.port}")
 
         # 2. Run schema initialization ONCE on Driver to ensure keyspace and table exist
         try:
@@ -313,6 +386,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 password=args.password,
                 keyspace=args.keyspace,
                 table=args.table,
+                astradb_bundle=args.astradb_bundle,
+                astradb_token=args.astradb_token,
             )
             print("[INFO] Cassandra Keyspace & Table schemas initialized/verified successfully on the Driver.")
         except Exception as exc:
@@ -327,6 +402,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             password=args.password,
             keyspace=args.keyspace,
             table=args.table,
+            astradb_bundle=args.astradb_bundle,
+            astradb_token=args.astradb_token,
         )
 
         # 4. Define micro-batch handler callback
@@ -350,7 +427,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             batch_df.unpersist()
 
         # 5. Configure the write stream with foreachBatch
-        checkpoint_dir = args.checkpoint_root / "gold_to_serving" / args.table
+        mode_str = "astradb" if using_astra else "local"
+        checkpoint_dir = args.checkpoint_root / f"gold_to_serving_{mode_str}" / args.table
         trigger_builder = {"once": True} if not args.continuous else {"processingTime": "30 seconds"}
 
         print(f"[INFO] Starting serving stream write to Cassandra Keyspace: '{args.keyspace}' Table: '{args.table}'")
