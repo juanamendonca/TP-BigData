@@ -177,10 +177,14 @@ Este paso requiere tener una base de datos activa. Elegí una de las siguientes 
    Para validar localmente, conectate a cqlsh:
    ```bash
    docker exec -it cassandra-local cqlsh
-   # Dentro de cqlsh:
-   USE finops;
-   SELECT * FROM org_daily_usage_by_service LIMIT 10;
    ```
+   Dentro de `cqlsh`, activá el keyspace corriendo `USE finops;` y luego ejecutá las consultas reales que se encuentran en el archivo `cql/02_queries_finops.cql` para corroborar los resultados.
+
+#### Validación automática de la Consulta #2 (Top-N acumulado)
+Para ver los resultados agrupados y ordenados de la consulta analítica #2 (Top-N servicios por costo acumulado en los últimos 14 días, tanto local como en AstraDB según tu configuración), ejecutá:
+```bash
+python query2_top_n_demo.py --config cassandra_config.json
+```
 
 ---
 
@@ -189,3 +193,4 @@ Este paso requiere tener una base de datos activa. Elegí una de las siguientes 
 Para leer en detalle el comportamiento de cada script, las salidas esperadas en disco, la validación de las reglas de calidad y el log con las decisiones de diseño arquitectónico de cada capa, consultá la documentación técnica:
 
 👉 **[DETALLES.md](file:///c:/Users/solro/TP-BigData/DETALLES.md)**
+

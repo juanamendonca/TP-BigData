@@ -183,16 +183,24 @@ CREATE TABLE IF NOT EXISTS {keyspace}.{table} (
 """.strip() + "\n"
 
     queries = f"""
--- Query #1: Daily usage/cost by service for one org in a month bucket
--- Cassandra queries are highly optimized because we partition by (org_id, month_bucket)
-SELECT *
+-- Consulta #1: Costos y requests diarios por org y servicio en un rango de fechas.
+-- Esta consulta es eficiente porque filtra por la clave de partición (org_id, month_bucket) 
+-- y hace un rango sobre la primera clustering key (event_date).
+SELECT org_id, month_bucket, event_date, service, daily_cost_usd, requests
 FROM {keyspace}.{table}
-WHERE org_id = 'org_001' AND month_bucket = '2025-08';
+WHERE org_id = 'org_xaji0y6d' 
+  AND month_bucket = '2025-07' 
+  AND event_date >= '2025-07-01' AND event_date <= '2025-07-31';
 
--- Query #2: Specific day + service lookup (drill-down using clustering keys)
-SELECT *
+-- Consulta #2: Datos para Top-N servicios por costo acumulado en los últimos 14 días para una organización.
+-- Cassandra (OLTP) no soporta ordenamientos dinámicos por métricas (daily_cost_usd) ni sumas acumuladas en tiempo de ejecución.
+-- Para resolver la consulta #2, se leen los datos del rango de fechas desde Cassandra:
+SELECT service, daily_cost_usd
 FROM {keyspace}.{table}
-WHERE org_id = 'org_001' AND month_bucket = '2025-08' AND event_date = '2025-08-15' AND service = 'compute';
+WHERE org_id = 'org_xaji0y6d' 
+  AND month_bucket IN ('2025-07', '2025-08') 
+  AND event_date >= '2025-07-18' AND event_date <= '2025-07-31';
+-- Y luego se realiza la agregación (SUM por servicio) y ordenamiento (Top-N).
 """.strip() + "\n"
 
     (cql_dir / "01_schema_finops.cql").write_text(ddl, encoding="utf-8")
