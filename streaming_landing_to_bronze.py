@@ -61,6 +61,7 @@ def build_spark(app_name: str) -> SparkSession:
         .getOrCreate()
     )
     spark.conf.set("spark.sql.session.timeZone", "UTC")
+    spark.conf.set("spark.sql.shuffle.partitions", "4")
     return spark
 
 

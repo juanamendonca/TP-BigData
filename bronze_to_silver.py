@@ -87,6 +87,7 @@ def build_spark(app_name: str) -> SparkSession:
     )
     spark.conf.set("spark.sql.session.timeZone", "UTC")
     spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+    spark.conf.set("spark.sql.shuffle.partitions", "4")
     return spark
 
 
@@ -197,7 +198,7 @@ def apply_quality_rules(events: DataFrame) -> DataFrame:
         )
         .withColumn(
             "dq_unit_when_value",
-            (~F.col("value_num").isNotNull()) | (F.length(F.col("unit")) > 0),
+            (~F.col("value_num").isNotNull()) | (F.coalesce(F.length(F.col("unit")), F.lit(0)) > 0),
         )
         .withColumn("anomaly_cost_flag", ~F.col("dq_cost_min_threshold"))
     )
@@ -241,7 +242,7 @@ def enrich_with_master(silver_events: DataFrame, customers: DataFrame) -> DataFr
 
 def build_daily_features(enriched_events: DataFrame, watermark_delay: str) -> DataFrame:
     return (
-        enriched_events.withWatermark("event_ts", watermark_delay)
+        enriched_events
         .groupBy(F.window("event_ts", "1 day").alias("event_window"), "org_id", "service")
         .agg(
             F.sum(F.coalesce(F.col("cost_usd_increment"), F.lit(0.0))).alias("daily_cost_usd"),
