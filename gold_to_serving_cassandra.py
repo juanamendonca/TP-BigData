@@ -7,32 +7,6 @@ This script:
 - Generates CQL DDL and sample queries (query-first).
 - Runs schema initialization (DDL) ONCE on the Driver before starting the stream.
 - Writes micro-batches to Cassandra using foreachBatch + distributed foreachPartition.
-
-========================================================================================
-ARCHITECTURAL CONSIDERATIONS & DESIGN ASSUMPTIONS:
-1. STREAM PATTERN (foreachBatch + foreachPartition):
-   - foreachBatch: se ejecuta una vez por micro-batch en el Driver (permite coordinar logs,
-     persistencias y checkpoints).
-   - foreachPartition: se ejecuta dentro de cada micro-batch, en paralelo, directamente
-     en los Spark Executors. Esto evita traer todas las filas al Driver (.collect() u OOMs)
-     y permite escalar la escritura a Cassandra distribuidamente.
-2. FILE STREAM APPEND-ONLY CONSTRAINT:
-   - Este script lee Gold mediante `readStream.parquet(...)`. Esto asume que el directorio
-     Gold recibe archivos nuevos en modo APPEND (incremental).
-   - Si el proceso anterior de Gold se reconstruye con reescritura total (overwrite batch),
-     la lectura streaming de archivos puede comportarse de manera frágil o redundante,
-     ya que Structured Streaming sobre archivos está diseñado para detectar nuevos archivos
-     adicionados, no reescrituras de directorios completos.
-     * Si Gold se escribe por Overwrite: Se recomienda ejecutar la carga a Cassandra en modo
-       Batch tradicional, o bien correr este job como una sincronización limpia post-batch.
-3. IDEMPOTENCIA EN CASSANDRA:
-   - La clave primaria de la tabla está definida como:
-     PRIMARY KEY ((org_id, month_bucket), event_date, service)
-   - Esto actúa como un UPSERT natural en Cassandra. Si un micro-lote o partición se
-     reprocesa debido a fallos de red, reintentos o restauración de checkpoints de Spark,
-     Cassandra actualizará las filas existentes para las mismas claves de negocio en lugar
-     de duplicar los registros físicos, garantizando consistencia e idempotencia absoluta.
-========================================================================================
 """
 
 from __future__ import annotations

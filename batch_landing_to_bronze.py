@@ -7,7 +7,6 @@ Aligned with first + second partial requirements for batch Bronze:
 - Parquet output,
 - sensible per-table partitioning,
 - technical columns ingest_ts and source_file,
-- deduplication when applicable,
 - basic non-null quality filters on critical keys,
 - idempotent re-run by partition overwrite.
 """

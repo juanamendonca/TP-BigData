@@ -13,7 +13,6 @@ Para ver las instrucciones de instalación y los comandos de ejecución, consult
 
 #### Qué hace el script:
 - Lee maestros CSV desde `datalake/landing` con esquema explícito (sin inferencia).
-- Aplica deduplicación por claves de negocio por tabla.
 - Agrega columnas técnicas:
   - `ingest_ts`
   - `source_file`
@@ -45,7 +44,7 @@ Parquet Bronze por tabla:
 
 ---
 
-### Parte 2: Streaming -> Bronze (PySpark Structured Streaming)
+### Parte 2: Streaming -> Bronze (Structured Streaming)
 **Script principal:** `streaming_landing_to_bronze.py`
 
 #### Qué hace el script:
@@ -68,7 +67,7 @@ Parquet Bronze por tabla:
 
 ---
 
-### Parte 3: Bronze -> Silver (PySpark)
+### Parte 3: Bronze -> Silver
 **Script principal:** `bronze_to_silver.py`
 
 #### Qué hace el script:
@@ -98,7 +97,7 @@ Parquet Bronze por tabla:
 
 ---
 
-### Parte 4: Silver -> Gold (PySpark)
+### Parte 4: Silver -> Gold 
 **Script principal:** `silver_to_gold.py`
 
 #### Qué hace el script:
