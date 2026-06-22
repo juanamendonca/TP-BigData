@@ -8,7 +8,7 @@ Para ver las instrucciones de instalación y los comandos de ejecución, consult
 
 ## Arquitectura
 
-![Diagrama de arquitectura MVP](doc/arquitectura_mvp.png)
+<img src="doc/arquitectura_mvp.png" width="600"/>
 
 ---
 
@@ -169,13 +169,13 @@ Parquet Bronze por tabla (mínimo requerido):
 Capturas de las consultas ejecutadas en AstraDB:
 
 **Query #1 — CQL Console:**
-![Q1](doc/evidence/Q1.png)
+<img src="doc/evidence/Q1.png" width="600"/>
 
 **Query #2 — CQL Console:**
-![Q2](doc/evidence/Q2.png)
+<img src="doc/evidence/Q2.png" width="600"/>
 
 **Query #2 Top-N acumulado vía `query2_top_n_demo.py`:**
-![Q2 Top-N](doc/evidence/Q2_top_n.png)
+<img src="doc/evidence/Q2_top_n.png" width="600"/>
 
 ### 6) Idempotencia y particionado — evidencia
 - Al final de cada script se imprime `[VERIFY] <dataset> total_rows=<n>`.
