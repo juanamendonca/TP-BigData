@@ -169,12 +169,15 @@ Parquet Bronze por tabla (mínimo requerido):
 Capturas de las consultas ejecutadas en AstraDB:
 
 **Query #1 — CQL Console:**
+
 <img src="doc/evidence/Q1.png" width="600"/>
 
 **Query #2 — CQL Console:**
+
 <img src="doc/evidence/Q2.png" width="600"/>
 
 **Query #2 Top-N acumulado vía `query2_top_n_demo.py`:**
+
 <img src="doc/evidence/Q2_top_n.png" width="600"/>
 
 ### 6) Idempotencia y particionado — evidencia
