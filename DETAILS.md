@@ -161,15 +161,21 @@ Parquet Bronze por tabla (mínimo requerido):
   Se ejecuta recuperando las filas del rango mediante CQL y agrupando/ordenando del lado del cliente en memoria.
 
 Capturas de las consultas ejecutadas en AstraDB:
-- `doc/evidence/Q1.png` — resultado de Query #1 en CQL Console
-- `doc/evidence/Q2.png` — resultado de Query #2 en CQL Console
-- `doc/evidence/Q2_top_n.png` — resultado del Top-N acumulado vía `query2_top_n_demo.py`
+
+**Query #1 — CQL Console:**
+![Q1](doc/evidence/Q1.png)
+
+**Query #2 — CQL Console:**
+![Q2](doc/evidence/Q2.png)
+
+**Query #2 Top-N acumulado vía `query2_top_n_demo.py`:**
+![Q2 Top-N](doc/evidence/Q2_top_n.png)
 
 ### 6) Idempotencia y particionado — evidencia
 - Al final de cada script se imprime `[VERIFY] <dataset> total_rows=<n>`.
 - Re-ejecutar con la misma entrada y misma configuración produce exactamente los mismos conteos sin duplicados físicos.
 - Serving usa clave primaria natural `PRIMARY KEY ((org_id, month_bucket), event_date, service)`, garantizando UPSERTS idempotentes.
-- Evidencia detallada de rutas, tamaños de particiones y conteos antes/después de reruns: `doc/idempotencia_particiones.pdf`.
+- Evidencia detallada de rutas, tamaños de particiones y conteos antes/después de reruns: [doc/idempotencia_particiones.pdf](doc/idempotencia_particiones.pdf).
 
 ---
 
