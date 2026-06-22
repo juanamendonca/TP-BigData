@@ -6,6 +6,12 @@ Para ver las instrucciones de instalación y los comandos de ejecución, consult
 
 ---
 
+## Arquitectura
+
+![Diagrama de arquitectura MVP](doc/arquitectura_mvp.png)
+
+---
+
 ## 1. Detalles Técnicos de las Capas
 
 ### Parte 1: Batch -> Bronze (PySpark)
