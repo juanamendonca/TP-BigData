@@ -90,9 +90,9 @@ Asegurate de estar posicionado en la carpeta raíz del proyecto, con el entorno 
 ### Paso 1 — Ingesta Batch a Bronze (Maestros)
 Procesa los archivos maestros desde `datalake/landing` hacia `datalake/bronze`:
 ```bash
-python batch_landing_to_bronze.py --batch-date 2026-06-15
+python batch_landing_to_bronze.py --batch-date 2026-06-15 --tables customers_orgs,users,billing_monthly
+
 ```
-*(Opcional: podés especificar tablas separadas por comas con `--tables customers_orgs,users`).*
 
 ---
 
@@ -188,9 +188,9 @@ python query2_top_n_demo.py --config cassandra_config.json
 
 ---
 
-## 📖 Arquitectura y Detalles del Diseño
+## Arquitectura y Detalles del Diseño
 
 Para leer en detalle el comportamiento de cada script, las salidas esperadas en disco, la validación de las reglas de calidad y el log con las decisiones de diseño arquitectónico de cada capa, consultá la documentación técnica:
 
-👉 **[DETALLES.md](file:///c:/Users/solro/TP-BigData/DETALLES.md)**
+**[DETAILS.md](DETAILS.md)**
 

@@ -235,6 +235,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         print(f"[INFO] Silver input records: {stats.records_silver_input}")
         print(f"[INFO] Gold output records: {stats.records_gold_output}")
+        if has_parquet_data(gold_path):
+            print(
+                f"[VERIFY] gold/org_daily_usage_by_service total_rows={stats.records_gold_output} "
+                "(compare this value across reruns for idempotency)"
+            )
         print("[OK] Gold mart completed. Manifest: datalake/gold/_control/manifest.json")
         return 0
     finally:

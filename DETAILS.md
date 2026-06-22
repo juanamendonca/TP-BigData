@@ -2,7 +2,7 @@
 
 Este documento contiene la explicación técnica detallada de cada capa del Data Lake, la estructura de directorios resultante, los criterios de aceptación y el log de decisiones arquitectónicas.
 
-Para ver las instrucciones de instalación y los comandos de ejecución, consultar el [README.md](file:///c:/Users/solro/TP-BigData/README.md).
+Para ver las instrucciones de instalación y los comandos de ejecución, consultar el [README.md](README.md).
 
 ---
 
@@ -12,34 +12,23 @@ Para ver las instrucciones de instalación y los comandos de ejecución, consult
 **Script principal:** `batch_landing_to_bronze.py`
 
 #### Qué hace el script:
-- Lee maestros CSV desde `datalake/landing` con esquema explícito (sin inferencia).
+- Lee los 3 maestros CSV mínimos desde `datalake/landing` con esquema explícito (sin inferencia): `customers_orgs`, `users`, `billing_monthly`.
 - Agrega columnas técnicas:
   - `ingest_ts`
   - `source_file`
   - `batch_date`
-- Deriva columnas temporales para particionado natural cuando aplica:
-  - `created_date = to_date(created_at)` en `support_tickets`
-  - `touch_date = to_date(timestamp)` en `marketing_touches`
 - Escribe Bronze en formato Parquet con particionado sensato por tabla:
   - `billing_monthly`: `month`
-  - `support_tickets`: `created_date`
-  - `marketing_touches`: `touch_date`
-  - `customers_orgs` y `users`: `load_date`
-  - `nps_surveys`: `survey_date`
-  - `resources`: `batch_date`
+  - `customers_orgs` y `users`: sin partición (tablas pequeñas)
 - Aplica controles básicos de calidad: filtro `NOT NULL` sobre claves críticas.
 - Genera manifest de control con conteos de lectura, post-calidad, post-dedupe y escritura.
 - Es idempotente por partición: reescribe las particiones objetivo del lote ejecutado.
 
 #### Salidas esperadas:
-Parquet Bronze por tabla:
+Parquet Bronze por tabla (mínimo requerido):
 - `billing_monthly`: `datalake/bronze/batch/billing_monthly/month=YYYY-MM-DD/`
-- `support_tickets`: `datalake/bronze/batch/support_tickets/created_date=YYYY-MM-DD/`
-- `marketing_touches`: `datalake/bronze/batch/marketing_touches/touch_date=YYYY-MM-DD/`
-- `customers_orgs`: `datalake/bronze/batch/customers_orgs/load_date=YYYY-MM-DD/`
-- `users`: `datalake/bronze/batch/users/load_date=YYYY-MM-DD/`
-- `nps_surveys`: `datalake/bronze/batch/nps_surveys/survey_date=YYYY-MM-DD/`
-- `resources`: `datalake/bronze/batch/resources/batch_date=YYYY-MM-DD/`
+- `customers_orgs`: `datalake/bronze/batch/customers_orgs/` (sin partición)
+- `users`: `datalake/bronze/batch/users/` (sin partición)
 - Manifest de corrida: `datalake/bronze/_control/batch_date=YYYY-MM-DD/manifest.json`
 
 ---
@@ -171,10 +160,16 @@ Parquet Bronze por tabla:
 - **Query #2** (Top-N servicios por costo acumulado en los últimos 14 días):
   Se ejecuta recuperando las filas del rango mediante CQL y agrupando/ordenando del lado del cliente en memoria.
 
-### 6) Idempotencia verificada con [VERIFY]
+Capturas de las consultas ejecutadas en AstraDB:
+- `doc/evidence/Q1.png` — resultado de Query #1 en CQL Console
+- `doc/evidence/Q2.png` — resultado de Query #2 en CQL Console
+- `doc/evidence/Q2_top_n.png` — resultado del Top-N acumulado vía `query2_top_n_demo.py`
+
+### 6) Idempotencia y particionado — evidencia
 - Al final de cada script se imprime `[VERIFY] <dataset> total_rows=<n>`.
 - Re-ejecutar con la misma entrada y misma configuración produce exactamente los mismos conteos sin duplicados físicos.
 - Serving usa clave primaria natural `PRIMARY KEY ((org_id, month_bucket), event_date, service)`, garantizando UPSERTS idempotentes.
+- Evidencia detallada de rutas, tamaños de particiones y conteos antes/después de reruns: `doc/idempotencia_particiones.pdf`.
 
 ---
 
@@ -185,4 +180,8 @@ Parquet Bronze por tabla:
 3. **Calidad de Datos:** En Silver se aplican reglas hard-fail que aíslan a quarantine y reglas soft-fail que marcan con flag de anomalía.
 4. **Modelo de Serving (Query-First):** Cassandra modelado estrictamente para consultas por organización y mes (`org_id`, `month_bucket`) y drill-down por fecha/servicio para garantizar tiempos de respuesta ultra-bajos.
 5. **Deduplicación y Regla de Unicidad (`dq_event_id_unique`):** En Structured Streaming, las fallas de duplicación de `event_id` ocurren por reintentos de red legítimos y no por corrupción estructural de datos. Por ende, la deduplicación se realiza de forma nativa a nivel de motor de streaming con `withWatermark` y `dropDuplicates(["event_id"])`. La regla en la capa de calidad se fija estáticamente en `True` para evitar enviar falsos positivos a la cuarentena física.
-6. **Limitaciones de Serving en Cassandra (Consulta Top-N):** Cassandra no soporta agrupamiento ni ordenamiento dinámico por métricas en tiempo de ejecución. Pre-calcular las sumas de ventanas de tiempo en una tabla dedicada en Cassandra no es viable ni escalable cuando los usuarios de los dashboards solicitan ventanas dinámicas (ej. últimos 7, 14 o 30 días, cuyos datos acumulados cambian diariamente). Por lo tanto, se implementó el patrón recomendado en NoSQL: la consulta CQL extrae el rango de fechas en disco (O(1) usando la clave de partición por organización y mes) y delega la agregación (SUM por servicio) y ordenamiento final (Top-N) a la capa del cliente.
+6. **Particionado por capa:**
+   - **Bronze batch maestros:** `billing_monthly` → `month` (consultas por período de facturación). `customers_orgs` y `users` → sin partición: tablas pequeñas (80 y 800 filas) leídas siempre completas como broadcast en Silver, el particionado no aporta pruning y solo generaría archivos diminutos.
+   - **Bronze streaming:** `event_date` — las queries de Gold filtran por rango de fechas del evento, no por fecha de ingestión. Permite partition pruning en Silver y Gold. Cardinalidad acotada y predecible (un directorio por día).
+   - **Silver y Gold:** `event_date` — coherente con el grano diario de las features y del mart FinOps. La idempotencia en reruns se logra con `partitionOverwriteMode=dynamic` que reescribe solo las particiones afectadas.
+7. **Limitaciones de Serving en Cassandra (Consulta Top-N):** Cassandra no soporta agrupamiento ni ordenamiento dinámico por métricas en tiempo de ejecución. Pre-calcular las sumas de ventanas de tiempo en una tabla dedicada en Cassandra no es viable ni escalable cuando los usuarios de los dashboards solicitan ventanas dinámicas (ej. últimos 7, 14 o 30 días, cuyos datos acumulados cambian diariamente). Por lo tanto, se implementó el patrón recomendado en NoSQL: la consulta CQL extrae el rango de fechas en disco (O(1) usando la clave de partición por organización y mes) y delega la agregación (SUM por servicio) y ordenamiento final (Top-N) a la capa del cliente.
