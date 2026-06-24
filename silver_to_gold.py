@@ -24,11 +24,15 @@ SILVER_FEATURES_SCHEMA = T.StructType(
         T.StructField("service", T.StringType(), True),
         T.StructField("daily_cost_usd", T.DoubleType(), True),
         T.StructField("requests", T.LongType(), True),
+        T.StructField("cpu_hours", T.DoubleType(), True),
+        T.StructField("storage_gb_hours", T.DoubleType(), True),
         T.StructField("genai_tokens_total", T.LongType(), True),
         T.StructField("carbon_kg_total", T.DoubleType(), True),
         T.StructField("events_count", T.LongType(), True),
         T.StructField("anomaly_events_count", T.LongType(), True),
         T.StructField("event_date", T.DateType(), True),
+        T.StructField("z_score", T.DoubleType(), True),
+        T.StructField("anomaly_zscore_flag", T.BooleanType(), True),
     ]
 )
 
@@ -125,10 +129,14 @@ def build_gold_mart(features: DataFrame) -> DataFrame:
             F.col("service"),
             F.round(F.col("daily_cost_usd"), 6).alias("daily_cost_usd"),
             F.col("requests").cast("long").alias("requests"),
+            F.round(F.col("cpu_hours"), 6).alias("cpu_hours"),
+            F.round(F.col("storage_gb_hours"), 6).alias("storage_gb_hours"),
             F.col("genai_tokens_total").cast("long").alias("genai_tokens_total"),
             F.round(F.col("carbon_kg_total"), 6).alias("carbon_kg_total"),
             F.col("events_count").cast("long").alias("events_count"),
             F.col("anomaly_events_count").cast("long").alias("anomaly_events_count"),
+            F.coalesce(F.col("z_score"), F.lit(0.0)).alias("z_score"),
+            F.coalesce(F.col("anomaly_zscore_flag"), F.lit(False)).alias("anomaly_zscore_flag"),
         )
         .withColumn("month_bucket", F.date_format(F.col("event_date"), "yyyy-MM"))
         .withColumn(
@@ -143,10 +151,11 @@ def write_gold(
     checkpoint_root: Path,
     mart: DataFrame,
     trigger_builder: dict,
-):
+) -> List:
+    # 1. org_daily_usage_by_service
     out_path = gold_root / "org_daily_usage_by_service"
     checkpoint_dir = checkpoint_root / "silver_to_gold" / "org_daily_usage_by_service"
-    return (
+    q_usage = (
         mart.writeStream.format("parquet")
         .outputMode("append")
         .option("checkpointLocation", str(checkpoint_dir))
@@ -154,6 +163,56 @@ def write_gold(
         .trigger(**trigger_builder)
         .start(str(out_path))
     )
+
+    # 2. genai_tokens_by_org_date
+    genai_mart = (
+        mart.filter((F.col("genai_tokens_total") > 0) | (F.col("service") == F.lit("genai")))
+        .select(
+            "event_date",
+            "org_id",
+            F.col("genai_tokens_total").alias("genai_tokens_total"),
+            F.col("daily_cost_usd").alias("estimated_cost_usd"),
+            "month_bucket"
+        )
+    )
+    out_path_genai = gold_root / "genai_tokens_by_org_date"
+    ckp_genai = checkpoint_root / "silver_to_gold" / "genai_tokens_by_org_date"
+    q_genai = (
+        genai_mart.writeStream.format("parquet")
+        .outputMode("append")
+        .option("checkpointLocation", str(ckp_genai))
+        .partitionBy("event_date")
+        .trigger(**trigger_builder)
+        .start(str(out_path_genai))
+    )
+
+    # 3. cost_anomaly_mart
+    anomaly_mart = (
+        mart.filter((F.col("anomaly_events_count") > 0) | (F.col("anomaly_zscore_flag") == F.lit(True)))
+        .select(
+            "event_date",
+            "org_id",
+            "service",
+            "anomaly_events_count",
+            "events_count",
+            "quality_score",
+            "z_score",
+            "anomaly_zscore_flag",
+            "month_bucket"
+        )
+    )
+    out_path_anomaly = gold_root / "cost_anomaly_mart"
+    ckp_anomaly = checkpoint_root / "silver_to_gold" / "cost_anomaly_mart"
+    q_anomaly = (
+        anomaly_mart.writeStream.format("parquet")
+        .outputMode("append")
+        .option("checkpointLocation", str(ckp_anomaly))
+        .partitionBy("event_date")
+        .trigger(**trigger_builder)
+        .start(str(out_path_anomaly))
+    )
+
+    return [q_usage, q_genai, q_anomaly]
 
 
 def write_manifest(gold_root: Path, stats: GoldStats, started_at: str, finished_at: str) -> None:
@@ -201,20 +260,20 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         trigger_builder = {"availableNow": True} if not args.continuous else {"processingTime": "30 seconds"}
 
-        query = write_gold(
+        queries = write_gold(
             gold_root=args.gold_root,
             checkpoint_root=args.checkpoint_root,
             mart=mart,
             trigger_builder=trigger_builder,
         )
         print(f"[INFO] Silver stream path: {args.silver_root / 'features_org_daily'}")
-        print(f"[INFO] Gold mart path: {args.gold_root / 'org_daily_usage_by_service'}")
         print(f"[INFO] Checkpoint root: {args.checkpoint_root / 'silver_to_gold'}")
         print(
             "[INFO] Running mode: "
             + ("continuous" if args.continuous else "availableNow micro-batches")
         )
-        query.awaitTermination()
+        for query in queries:
+            query.awaitTermination()
 
         if args.continuous:
             return 0
@@ -240,10 +299,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"[VERIFY] gold/org_daily_usage_by_service total_rows={stats.records_gold_output} "
                 "(compare this value across reruns for idempotency)"
             )
-        print("[OK] Gold mart completed. Manifest: datalake/gold/_control/manifest.json")
+        print("[OK] Gold marts completed. Manifest: datalake/gold/_control/manifest.json")
         return 0
     finally:
         spark.stop()
+
 
 
 if __name__ == "__main__":

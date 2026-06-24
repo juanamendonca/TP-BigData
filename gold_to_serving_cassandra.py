@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Gold -> Serving (Cassandra/AstraDB) (point 5).
+Gold -> Serving (Cassandra/AstraDB).
 
 This script:
-- Reads Gold mart org_daily_usage_by_service using Spark Structured Streaming (readStream).
-- Generates CQL DDL and sample queries (query-first).
-- Runs schema initialization (DDL) ONCE on the Driver before starting the stream.
-- Writes micro-batches to Cassandra using foreachBatch + distributed foreachPartition.
+- Supports 5 Gold marts (both batch and streaming grain).
+- Generates CQL DDL and 5 analytical queries.
+- Runs schema initialization (DDL) for all tables on the Driver.
+- Writes streaming marts using Spark Structured Streaming + foreachBatch + foreachPartition.
+- Writes batch marts using static Spark read + RDD foreachPartition.
+- Supports AstraDB cloud and local Docker modes.
 """
 
 from __future__ import annotations
@@ -20,26 +22,64 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
-# For streaming Parquet, Spark requires an explicit schema
-GOLD_SCHEMA = T.StructType(
-    [
+# Spark Schemas for the 5 Gold Marts
+SCHEMAS = {
+    "org_daily_usage_by_service": T.StructType([
         T.StructField("event_date", T.DateType(), True),
         T.StructField("org_id", T.StringType(), True),
         T.StructField("service", T.StringType(), True),
         T.StructField("daily_cost_usd", T.DoubleType(), True),
         T.StructField("requests", T.LongType(), True),
+        T.StructField("cpu_hours", T.DoubleType(), True),
+        T.StructField("storage_gb_hours", T.DoubleType(), True),
         T.StructField("genai_tokens_total", T.LongType(), True),
         T.StructField("carbon_kg_total", T.DoubleType(), True),
         T.StructField("events_count", T.LongType(), True),
         T.StructField("anomaly_events_count", T.LongType(), True),
         T.StructField("month_bucket", T.StringType(), True),
         T.StructField("quality_score", T.DoubleType(), True),
-    ]
-)
+    ]),
+    "revenue_by_org_month": T.StructType([
+        T.StructField("org_id", T.StringType(), True),
+        T.StructField("month", T.StringType(), True),
+        T.StructField("revenue_usd", T.DoubleType(), True),
+        T.StructField("credits_usd", T.DoubleType(), True),
+        T.StructField("taxes_usd", T.DoubleType(), True),
+        T.StructField("fx_applied", T.DoubleType(), True),
+        T.StructField("net_revenue_usd", T.DoubleType(), True),
+    ]),
+    "tickets_by_org_date": T.StructType([
+        T.StructField("org_id", T.StringType(), True),
+        T.StructField("event_date", T.DateType(), True),
+        T.StructField("ticket_count", T.LongType(), True),
+        T.StructField("sla_breach_rate", T.DoubleType(), True),
+        T.StructField("csat_avg", T.DoubleType(), True),
+        T.StructField("severity_breakdown", T.MapType(T.StringType(), T.LongType()), True),
+        T.StructField("month_bucket", T.StringType(), True),
+    ]),
+    "genai_tokens_by_org_date": T.StructType([
+        T.StructField("event_date", T.DateType(), True),
+        T.StructField("org_id", T.StringType(), True),
+        T.StructField("genai_tokens_total", T.LongType(), True),
+        T.StructField("estimated_cost_usd", T.DoubleType(), True),
+        T.StructField("month_bucket", T.StringType(), True),
+    ]),
+    "cost_anomaly_mart": T.StructType([
+        T.StructField("event_date", T.DateType(), True),
+        T.StructField("org_id", T.StringType(), True),
+        T.StructField("service", T.StringType(), True),
+        T.StructField("anomaly_events_count", T.LongType(), True),
+        T.StructField("events_count", T.LongType(), True),
+        T.StructField("quality_score", T.DoubleType(), True),
+        T.StructField("z_score", T.DoubleType(), True),
+        T.StructField("anomaly_zscore_flag", T.BooleanType(), True),
+        T.StructField("month_bucket", T.StringType(), True),
+    ]),
+}
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Load Gold mart into Cassandra/AstraDB.")
+    parser = argparse.ArgumentParser(description="Load Gold marts into Cassandra/AstraDB.")
     parser.add_argument(
         "--gold-root",
         type=Path,
@@ -57,7 +97,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--table",
         type=str,
         default="org_daily_usage_by_service",
-        help="Cassandra table name.",
+        choices=list(SCHEMAS.keys()),
+        help="Cassandra table name to process.",
     )
     parser.add_argument("--host", type=str, default=None, help="Cassandra host (local mode).")
     parser.add_argument("--port", type=int, default=9042, help="Cassandra native transport port (local mode).")
@@ -102,11 +143,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def load_config(config_path: str, args: argparse.Namespace) -> argparse.Namespace:
-    """
-    Reads cassandra_config.json and fills in args fields that were not
-    explicitly set via CLI (i.e., still at their default None/False values).
-    Explicit CLI args always take precedence over the config file.
-    """
     import json
     with open(config_path) as f:
         cfg = json.load(f)
@@ -122,31 +158,32 @@ def load_config(config_path: str, args: argparse.Namespace) -> argparse.Namespac
     else:
         if args.host is None:
             args.host = section.get("host", "127.0.0.1")
-        if args.port == 9042:  # default value — safe to override
+        if args.port == 9042:
             args.port = section.get("port", 9042)
 
-    if args.keyspace == "finops":  # default value
+    if args.keyspace == "finops":
         args.keyspace = section.get("keyspace", "finops")
-    if args.table == "org_daily_usage_by_service":  # default value
-        args.table = section.get("table", "org_daily_usage_by_service")
 
     return args
 
 
-def generate_cql_files(cql_dir: Path, keyspace: str, table: str) -> None:
+def generate_cql_files(cql_dir: Path, keyspace: str) -> None:
     cql_dir.mkdir(parents=True, exist_ok=True)
 
     ddl = f"""
 CREATE KEYSPACE IF NOT EXISTS {keyspace}
 WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': 1}};
 
-CREATE TABLE IF NOT EXISTS {keyspace}.{table} (
+-- 1) org_daily_usage_by_service: query por org + month + date + servicio
+CREATE TABLE IF NOT EXISTS {keyspace}.org_daily_usage_by_service (
     org_id text,
     month_bucket text,
     event_date date,
     service text,
     daily_cost_usd double,
     requests bigint,
+    cpu_hours double,
+    storage_gb_hours double,
     genai_tokens_total bigint,
     carbon_kg_total double,
     events_count bigint,
@@ -154,27 +191,93 @@ CREATE TABLE IF NOT EXISTS {keyspace}.{table} (
     quality_score double,
     PRIMARY KEY ((org_id, month_bucket), event_date, service)
 ) WITH CLUSTERING ORDER BY (event_date DESC, service ASC);
+
+-- 2) revenue_by_org_month: query por org + mes de facturacion
+CREATE TABLE IF NOT EXISTS {keyspace}.revenue_by_org_month (
+    org_id text,
+    month text,
+    revenue_usd double,
+    credits_usd double,
+    taxes_usd double,
+    net_revenue_usd double,
+    fx_applied double,
+    PRIMARY KEY ((org_id), month)
+) WITH CLUSTERING ORDER BY (month DESC);
+
+-- 3) tickets_by_org_date: query por org + month + event_date con severity breakdown en Coleccion (Map)
+CREATE TABLE IF NOT EXISTS {keyspace}.tickets_by_org_date (
+    org_id text,
+    month_bucket text,
+    event_date date,
+    ticket_count bigint,
+    sla_breach_rate double,
+    csat_avg double,
+    severity_breakdown map<text, int>,
+    PRIMARY KEY ((org_id, month_bucket), event_date)
+) WITH CLUSTERING ORDER BY (event_date DESC);
+
+-- 4) genai_tokens_by_org_date: query por org + month + event_date
+CREATE TABLE IF NOT EXISTS {keyspace}.genai_tokens_by_org_date (
+    org_id text,
+    month_bucket text,
+    event_date date,
+    genai_tokens_total bigint,
+    estimated_cost_usd double,
+    PRIMARY KEY ((org_id, month_bucket), event_date)
+) WITH CLUSTERING ORDER BY (event_date DESC);
+
+-- 5) cost_anomaly_mart: query por org + month + event_date + service para ver anomalias (flag y zscore)
+CREATE TABLE IF NOT EXISTS {keyspace}.cost_anomaly_mart (
+    org_id text,
+    month_bucket text,
+    event_date date,
+    service text,
+    anomaly_events_count bigint,
+    events_count bigint,
+    quality_score double,
+    z_score double,
+    anomaly_zscore_flag boolean,
+    PRIMARY KEY ((org_id, month_bucket), event_date, service)
+) WITH CLUSTERING ORDER BY (event_date DESC, service ASC);
 """.strip() + "\n"
 
     queries = f"""
 -- Consulta #1: Costos y requests diarios por org y servicio en un rango de fechas.
--- Esta consulta es eficiente porque filtra por la clave de partición (org_id, month_bucket) 
--- y hace un rango sobre la primera clustering key (event_date).
 SELECT org_id, month_bucket, event_date, service, daily_cost_usd, requests
-FROM {keyspace}.{table}
+FROM {keyspace}.org_daily_usage_by_service
 WHERE org_id = 'org_xaji0y6d' 
   AND month_bucket = '2025-07' 
   AND event_date >= '2025-07-01' AND event_date <= '2025-07-31';
 
 -- Consulta #2: Datos para Top-N servicios por costo acumulado en los últimos 14 días para una organización.
--- Cassandra (OLTP) no soporta ordenamientos dinámicos por métricas (daily_cost_usd) ni sumas acumuladas en tiempo de ejecución.
--- Para resolver la consulta #2, se leen los datos del rango de fechas desde Cassandra:
 SELECT service, daily_cost_usd
-FROM {keyspace}.{table}
+FROM {keyspace}.org_daily_usage_by_service
 WHERE org_id = 'org_xaji0y6d' 
   AND month_bucket IN ('2025-07', '2025-08') 
   AND event_date >= '2025-07-18' AND event_date <= '2025-07-31';
--- Y luego se realiza la agregación (SUM por servicio) y ordenamiento (Top-N).
+
+-- Consulta #3: Evolución de tickets críticos y tasa de SLA breach por día (últimos 30 días).
+-- Permite visualizar la evolución de tickets de soporte y SLA breaches. 
+-- El desglose por severidad se extrae de la colección severity_breakdown (map).
+SELECT event_date, ticket_count, sla_breach_rate, csat_avg, severity_breakdown
+FROM {keyspace}.tickets_by_org_date
+WHERE org_id = 'org_xaji0y6d' 
+  AND month_bucket = '2025-07' 
+  AND event_date >= '2025-07-01' AND event_date <= '2025-07-31';
+
+-- Consulta #4: Revenue mensual con créditos/impuestos aplicados (normalizado a USD).
+-- Muestra la facturación neta mensual consolidada de la organización.
+SELECT org_id, month, revenue_usd, credits_usd, taxes_usd, net_revenue_usd, fx_applied
+FROM {keyspace}.revenue_by_org_month
+WHERE org_id = 'org_xaji0y6d';
+
+-- Consulta #5: Tokens GenAI y costo estimado por día.
+-- Permite monitorear el consumo de Inteligencia Artificial Generativa y sus costos asociados por organización.
+SELECT event_date, genai_tokens_total, estimated_cost_usd
+FROM {keyspace}.genai_tokens_by_org_date
+WHERE org_id = 'org_xaji0y6d' 
+  AND month_bucket = '2025-07' 
+  AND event_date >= '2025-07-01' AND event_date <= '2025-07-31';
 """.strip() + "\n"
 
     (cql_dir / "01_schema_finops.cql").write_text(ddl, encoding="utf-8")
@@ -204,19 +307,11 @@ def _build_cluster(host, port, username, password, astradb_bundle=None, astradb_
 
 
 def initialize_cassandra_schema(host: Optional[str], port: int, username: Optional[str], password: Optional[str],
-                               keyspace: str, table: str,
-                               astradb_bundle: Optional[str] = None, astradb_token: Optional[str] = None) -> None:
-    """
-    Initializes/verifies Keyspace and Table schema exactly ONCE on the Spark Driver
-    prior to starting the Structured Streaming process.
-
-    - Local mode: creates keyspace + table if they don't exist.
-    - AstraDB mode: keyspace must exist (created via Astra console); only creates the table.
-    """
+                               keyspace: str, astradb_bundle: Optional[str] = None, astradb_token: Optional[str] = None) -> None:
     cluster = _build_cluster(host, port, username, password, astradb_bundle, astradb_token)
     session = cluster.connect()
 
-    print(f"[INFO] Initializing schema '{keyspace}.{table}' on Cassandra endpoint...")
+    print(f"[INFO] Initializing keyspace and tables on Cassandra...")
 
     if not astradb_bundle:
         session.execute(
@@ -227,20 +322,88 @@ def initialize_cassandra_schema(host: Optional[str], port: int, username: Option
         )
 
     session.set_keyspace(keyspace)
+
+    # 1) org_daily_usage_by_service
     session.execute(
         f"""
-        CREATE TABLE IF NOT EXISTS {table} (
+        CREATE TABLE IF NOT EXISTS org_daily_usage_by_service (
             org_id text,
             month_bucket text,
             event_date date,
             service text,
             daily_cost_usd double,
             requests bigint,
+            cpu_hours double,
+            storage_gb_hours double,
             genai_tokens_total bigint,
             carbon_kg_total double,
             events_count bigint,
             anomaly_events_count bigint,
             quality_score double,
+            PRIMARY KEY ((org_id, month_bucket), event_date, service)
+        ) WITH CLUSTERING ORDER BY (event_date DESC, service ASC)
+        """
+    )
+
+    # 2) revenue_by_org_month
+    session.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS revenue_by_org_month (
+            org_id text,
+            month text,
+            revenue_usd double,
+            credits_usd double,
+            taxes_usd double,
+            net_revenue_usd double,
+            fx_applied double,
+            PRIMARY KEY ((org_id), month)
+        ) WITH CLUSTERING ORDER BY (month DESC)
+        """
+    )
+
+    # 3) tickets_by_org_date
+    session.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS tickets_by_org_date (
+            org_id text,
+            month_bucket text,
+            event_date date,
+            ticket_count bigint,
+            sla_breach_rate double,
+            csat_avg double,
+            severity_breakdown map<text, int>,
+            PRIMARY KEY ((org_id, month_bucket), event_date)
+        ) WITH CLUSTERING ORDER BY (event_date DESC)
+        """
+    )
+
+    # 4) genai_tokens_by_org_date
+    session.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS genai_tokens_by_org_date (
+            org_id text,
+            month_bucket text,
+            event_date date,
+            genai_tokens_total bigint,
+            estimated_cost_usd double,
+            PRIMARY KEY ((org_id, month_bucket), event_date)
+        ) WITH CLUSTERING ORDER BY (event_date DESC)
+        """
+    )
+
+    # 5) cost_anomaly_mart
+    session.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS cost_anomaly_mart (
+            org_id text,
+            month_bucket text,
+            event_date date,
+            service text,
+            anomaly_events_count bigint,
+            events_count bigint,
+            quality_score double,
+            z_score double,
+            anomaly_zscore_flag boolean,
             PRIMARY KEY ((org_id, month_bucket), event_date, service)
         ) WITH CLUSTERING ORDER BY (event_date DESC, service ASC)
         """
@@ -253,47 +416,133 @@ def initialize_cassandra_schema(host: Optional[str], port: int, username: Option
 def build_partition_writer(host: Optional[str], port: int, username: Optional[str], password: Optional[str],
                            keyspace: str, table: str,
                            astradb_bundle: Optional[str] = None, astradb_token: Optional[str] = None):
-    """
-    Creates a serialized closure function that will run on Spark Executors
-    to write a single partition of a micro-batch into Cassandra.
-
-    Supports both local (host/port) and AstraDB cloud (bundle/token) modes.
-    """
     def write_partition(rows):
         cluster = _build_cluster(host, port, username, password, astradb_bundle, astradb_token)
-        # Connect directly to the specific keyspace
         session = cluster.connect(keyspace)
 
-        prepared = session.prepare(
-            f"""
-            INSERT INTO {table}
-            (org_id, month_bucket, event_date, service, daily_cost_usd, requests,
-             genai_tokens_total, carbon_kg_total, events_count, anomaly_events_count, quality_score)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """
-        )
-
-        for row in rows:
-            # Skip invalid rows lacking primary partition/clustering keys
-            if row["org_id"] is None or row["month_bucket"] is None or row["event_date"] is None:
-                continue
-
-            session.execute(
-                prepared,
-                (
-                    row["org_id"],
-                    row["month_bucket"],
-                    row["event_date"],
-                    row["service"],
-                    float(row["daily_cost_usd"]) if row["daily_cost_usd"] is not None else None,
-                    int(row["requests"]) if row["requests"] is not None else None,
-                    int(row["genai_tokens_total"]) if row["genai_tokens_total"] is not None else None,
-                    float(row["carbon_kg_total"]) if row["carbon_kg_total"] is not None else None,
-                    int(row["events_count"]) if row["events_count"] is not None else None,
-                    int(row["anomaly_events_count"]) if row["anomaly_events_count"] is not None else None,
-                    float(row["quality_score"]) if row["quality_score"] is not None else None,
-                ),
+        if table == "org_daily_usage_by_service":
+            prepared = session.prepare(
+                f"""
+                INSERT INTO {table}
+                (org_id, month_bucket, event_date, service, daily_cost_usd, requests,
+                 cpu_hours, storage_gb_hours, genai_tokens_total, carbon_kg_total,
+                 events_count, anomaly_events_count, quality_score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """
             )
+            for row in rows:
+                if row["org_id"] is None or row["month_bucket"] is None or row["event_date"] is None:
+                    continue
+                session.execute(
+                    prepared,
+                    (
+                        row["org_id"],
+                        row["month_bucket"],
+                        row["event_date"],
+                        row["service"],
+                        float(row["daily_cost_usd"]) if row["daily_cost_usd"] is not None else None,
+                        int(row["requests"]) if row["requests"] is not None else None,
+                        float(row["cpu_hours"]) if row["cpu_hours"] is not None else None,
+                        float(row["storage_gb_hours"]) if row["storage_gb_hours"] is not None else None,
+                        int(row["genai_tokens_total"]) if row["genai_tokens_total"] is not None else None,
+                        float(row["carbon_kg_total"]) if row["carbon_kg_total"] is not None else None,
+                        int(row["events_count"]) if row["events_count"] is not None else None,
+                        int(row["anomaly_events_count"]) if row["anomaly_events_count"] is not None else None,
+                        float(row["quality_score"]) if row["quality_score"] is not None else None,
+                    ),
+                )
+        elif table == "revenue_by_org_month":
+            prepared = session.prepare(
+                f"""
+                INSERT INTO {table}
+                (org_id, month, revenue_usd, credits_usd, taxes_usd, net_revenue_usd, fx_applied)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """
+            )
+            for row in rows:
+                if row["org_id"] is None or row["month"] is None:
+                    continue
+                session.execute(
+                    prepared,
+                    (
+                        row["org_id"],
+                        row["month"],
+                        float(row["revenue_usd"]) if row["revenue_usd"] is not None else None,
+                        float(row["credits_usd"]) if row["credits_usd"] is not None else None,
+                        float(row["taxes_usd"]) if row["taxes_usd"] is not None else None,
+                        float(row["net_revenue_usd"]) if row["net_revenue_usd"] is not None else None,
+                        float(row["fx_applied"]) if row["fx_applied"] is not None else None,
+                    ),
+                )
+        elif table == "tickets_by_org_date":
+            prepared = session.prepare(
+                f"""
+                INSERT INTO {table}
+                (org_id, month_bucket, event_date, ticket_count, sla_breach_rate, csat_avg, severity_breakdown)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """
+            )
+            for row in rows:
+                if row["org_id"] is None or row["month_bucket"] is None or row["event_date"] is None:
+                    continue
+                session.execute(
+                    prepared,
+                    (
+                        row["org_id"],
+                        row["month_bucket"],
+                        row["event_date"],
+                        int(row["ticket_count"]) if row["ticket_count"] is not None else None,
+                        float(row["sla_breach_rate"]) if row["sla_breach_rate"] is not None else None,
+                        float(row["csat_avg"]) if row["csat_avg"] is not None else None,
+                        {k: int(v) for k, v in row["severity_breakdown"].items()} if row["severity_breakdown"] is not None else None,
+                    ),
+                )
+        elif table == "genai_tokens_by_org_date":
+            prepared = session.prepare(
+                f"""
+                INSERT INTO {table}
+                (org_id, month_bucket, event_date, genai_tokens_total, estimated_cost_usd)
+                VALUES (?, ?, ?, ?, ?)
+                """
+            )
+            for row in rows:
+                if row["org_id"] is None or row["month_bucket"] is None or row["event_date"] is None:
+                    continue
+                session.execute(
+                    prepared,
+                    (
+                        row["org_id"],
+                        row["month_bucket"],
+                        row["event_date"],
+                        int(row["genai_tokens_total"]) if row["genai_tokens_total"] is not None else None,
+                        float(row["estimated_cost_usd"]) if row["estimated_cost_usd"] is not None else None,
+                    ),
+                )
+        elif table == "cost_anomaly_mart":
+            prepared = session.prepare(
+                f"""
+                INSERT INTO {table}
+                (org_id, month_bucket, event_date, service, anomaly_events_count, events_count, quality_score, z_score, anomaly_zscore_flag)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """
+            )
+            for row in rows:
+                if row["org_id"] is None or row["month_bucket"] is None or row["event_date"] is None:
+                    continue
+                session.execute(
+                    prepared,
+                    (
+                        row["org_id"],
+                        row["month_bucket"],
+                        row["event_date"],
+                        row["service"],
+                        int(row["anomaly_events_count"]) if row["anomaly_events_count"] is not None else None,
+                        int(row["events_count"]) if row["events_count"] is not None else None,
+                        float(row["quality_score"]) if row["quality_score"] is not None else None,
+                        float(row["z_score"]) if row["z_score"] is not None else None,
+                        bool(row["anomaly_zscore_flag"]) if row["anomaly_zscore_flag"] is not None else None,
+                    ),
+                )
 
         session.shutdown()
         cluster.shutdown()
@@ -311,14 +560,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         args = load_config(args.config, args)
         print(f"[INFO] Loaded config from: {args.config}")
 
-    generate_cql_files(args.cql_dir, args.keyspace, args.table)
-    print(f"[INFO] CQL generated: {args.cql_dir / '01_schema_finops.cql'}")
-    print(f"[INFO] CQL generated: {args.cql_dir / '02_queries_finops.cql'}")
+    generate_cql_files(args.cql_dir, args.keyspace)
+    print(f"[INFO] CQL schemas generated in {args.cql_dir}")
 
-    # Build Spark supporting dynamic schema inference in streaming
     spark = (
         SparkSession.builder
-        .appName("gold_to_serving_cassandra_streaming")
+        .appName("gold_to_serving_cassandra")
         .config("spark.driver.extraJavaOptions", "-Djava.security.manager=allow")
         .config("spark.executor.extraJavaOptions", "-Djava.security.manager=allow")
         .config("spark.sql.streaming.schemaInference", "true")
@@ -326,22 +573,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     spark.conf.set("spark.sql.session.timeZone", "UTC")
 
-    gold_path = args.gold_root / "org_daily_usage_by_service"
+    gold_path = args.gold_root / args.table
     if not gold_path.exists():
         print(f"[WARN] Gold path does not exist yet: {gold_path}. Waiting for data...")
         gold_path.mkdir(parents=True, exist_ok=True)
 
     try:
-        # 1. Read Gold parquet directory as a STREAM
-        gold_stream_df = (
-            spark.readStream
-            .schema(GOLD_SCHEMA)
-            .parquet(str(gold_path))
-        )
-
         if not args.write_serving:
-            print("[INFO] Dry-run mode (no Cassandra write). Streaming query dry-run.")
-            print(f"[INFO] Gold stream schema: {gold_stream_df.schema}")
+            print("[INFO] Dry-run mode (no Cassandra write). Checking Gold schema...")
+            # If path has data, print count
+            if any(gold_path.rglob("*.parquet")):
+                df = spark.read.schema(SCHEMAS[args.table]).parquet(str(gold_path))
+                print(f"[INFO] Dry-run: read {df.count()} records for table {args.table}")
             return 0
 
         using_astra = bool(args.astradb_bundle)
@@ -359,7 +602,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 2
             print(f"[INFO] Local mode: {args.host}:{args.port}")
 
-        # 2. Run schema initialization ONCE on Driver to ensure keyspace and table exist
+        # Initialize schema for ALL tables on Driver
         try:
             initialize_cassandra_schema(
                 host=args.host,
@@ -367,16 +610,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                 username=args.username,
                 password=args.password,
                 keyspace=args.keyspace,
-                table=args.table,
                 astradb_bundle=args.astradb_bundle,
                 astradb_token=args.astradb_token,
             )
-            print("[INFO] Cassandra Keyspace & Table schemas initialized/verified successfully on the Driver.")
+            print("[INFO] Cassandra Keyspace & Tables schemas initialized/verified successfully on the Driver.")
         except Exception as exc:
             print(f"[ERROR] Failed to initialize Cassandra schema from Driver: {exc}")
             return 2
 
-        # 3. Create executor partition writer function
+        # Create closure partition writer function for this specific table
         partition_writer = build_partition_writer(
             host=args.host,
             port=args.port,
@@ -388,42 +630,44 @@ def main(argv: Optional[List[str]] = None) -> int:
             astradb_token=args.astradb_token,
         )
 
-        # 4. Define micro-batch handler callback
-        def write_micro_batch(batch_df, batch_id):
-            """
-            This callback executes on the Driver for every micro-batch.
-            Using batch_df.persist() prevents the micro-batch from being computed twice
-            (once for the .count() action and once for the .foreachPartition() action).
-            """
-            # Persist the micro-batch to optimize performance and prevent re-evaluation
-            batch_df.persist()
-            rows = batch_df.count()
-            print(f"[INFO] Processing micro-batch {batch_id} (rows: {rows})")
+        is_batch_table = args.table in ("revenue_by_org_month", "tickets_by_org_date")
 
+        if is_batch_table:
+            print(f"[INFO] Table '{args.table}' is BATCH. Reading Gold parquet statically...")
+            gold_df = spark.read.schema(SCHEMAS[args.table]).parquet(str(gold_path))
+            gold_df.persist()
+            rows = gold_df.count()
+            print(f"[INFO] Processing static table '{args.table}' (rows: {rows})")
             if rows > 0:
-                # Distribute the write using Spark's foreachPartition.
-                # foreachPartition runs in parallel on executors per partition of the micro-batch,
-                # avoiding bringing rows to the Driver (No collect/OOMs) and ensuring scalability.
-                batch_df.rdd.foreachPartition(partition_writer)
+                gold_df.rdd.foreachPartition(partition_writer)
+            gold_df.unpersist()
+            print(f"[OK] Batch load to Cassandra table '{args.table}' completed successfully.")
+        else:
+            print(f"[INFO] Table '{args.table}' is STREAMING. Starting serving stream...")
+            gold_stream_df = spark.readStream.schema(SCHEMAS[args.table]).parquet(str(gold_path))
 
-            batch_df.unpersist()
+            def write_micro_batch(batch_df, batch_id):
+                batch_df.persist()
+                rows = batch_df.count()
+                print(f"[INFO] Processing micro-batch {batch_id} (rows: {rows})")
+                if rows > 0:
+                    batch_df.rdd.foreachPartition(partition_writer)
+                batch_df.unpersist()
 
-        # 5. Configure the write stream with foreachBatch
-        mode_str = "astradb" if using_astra else "local"
-        checkpoint_dir = args.checkpoint_root / f"gold_to_serving_{mode_str}" / args.table
-        trigger_builder = {"once": True} if not args.continuous else {"processingTime": "30 seconds"}
+            mode_str = "astradb" if using_astra else "local"
+            checkpoint_dir = args.checkpoint_root / f"gold_to_serving_{mode_str}" / args.table
+            trigger_builder = {"once": True} if not args.continuous else {"processingTime": "30 seconds"}
 
-        print(f"[INFO] Starting serving stream write to Cassandra Keyspace: '{args.keyspace}' Table: '{args.table}'")
-        query = (
-            gold_stream_df.writeStream
-            .foreachBatch(write_micro_batch)
-            .option("checkpointLocation", str(checkpoint_dir))
-            .trigger(**trigger_builder)
-            .start()
-        )
-
-        query.awaitTermination()
-        print("[OK] Serving stream terminated successfully.")
+            print(f"[INFO] Starting serving stream write to Cassandra Keyspace: '{args.keyspace}' Table: '{args.table}'")
+            query = (
+                gold_stream_df.writeStream
+                .foreachBatch(write_micro_batch)
+                .option("checkpointLocation", str(checkpoint_dir))
+                .trigger(**trigger_builder)
+                .start()
+            )
+            query.awaitTermination()
+            print(f"[OK] Serving stream for '{args.table}' completed successfully.")
         return 0
 
     finally:
@@ -431,4 +675,5 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import sys
+    sys.exit(main())

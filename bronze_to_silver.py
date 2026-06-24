@@ -143,9 +143,11 @@ def load_bronze_inputs(
     spark: SparkSession,
     bronze_root: Path,
     max_files_per_trigger: int,
-) -> tuple[DataFrame, DataFrame]:
+) -> tuple[DataFrame, DataFrame, DataFrame, DataFrame]:
     usage_path = bronze_root / "streaming" / "usage_events"
     customers_path = bronze_root / "batch" / "customers_orgs"
+    users_path = bronze_root / "batch" / "users"
+    resources_path = bronze_root / "batch" / "resources"
 
     if not has_parquet_data(usage_path):
         raise FileNotFoundError(
@@ -168,7 +170,17 @@ def load_bronze_inputs(
         "hq_region",
         "is_enterprise",
     )
-    return usage, customers
+    users = spark.read.parquet(str(users_path)).select(
+        "org_id",
+        "user_id",
+        "active",
+    )
+    resources = spark.read.parquet(str(resources_path)).select(
+        "resource_id",
+        "state",
+        "tags_json",
+    )
+    return usage, customers, users, resources
 
 
 def prepare_events(usage: DataFrame) -> DataFrame:
@@ -236,12 +248,70 @@ def split_silver_and_quarantine(flagged: DataFrame) -> tuple[DataFrame, DataFram
     return silver_events, quarantine
 
 
-def enrich_with_master(silver_events: DataFrame, customers: DataFrame) -> DataFrame:
-    return silver_events.join(customers, on="org_id", how="left")
+def enrich_with_master(
+    silver_events: DataFrame,
+    customers: DataFrame,
+    users: DataFrame,
+    resources: DataFrame,
+) -> DataFrame:
+    # Pre-aggregate users per org to avoid cartesian product (since org has multiple users)
+    users_agg = users.groupBy("org_id").agg(
+        F.count("user_id").alias("total_org_users"),
+        F.sum(F.when(F.col("active") == True, F.lit(1)).otherwise(F.lit(0))).alias("active_org_users")
+    )
+    
+    # Rename resource columns to avoid collisions
+    resources_clean = resources.select(
+        F.col("resource_id"),
+        F.col("state").alias("resource_state"),
+        F.col("tags_json").alias("resource_tags_json")
+    )
+    
+    # Join with orgs (customers), users, and resources
+    enriched_orgs = silver_events.join(customers, on="org_id", how="left")
+    enriched_users = enriched_orgs.join(users_agg, on="org_id", how="left")
+    enriched_all = enriched_users.join(resources_clean, on="resource_id", how="left")
+    
+    return enriched_all
 
 
 def build_daily_features(enriched_events: DataFrame, watermark_delay: str) -> DataFrame:
-    return (
+    spark = enriched_events.sparkSession
+    
+    # Path to Bronze usage events for static historical calculation
+    usage_path = Path("datalake") / "bronze" / "streaming" / "usage_events"
+    
+    if has_parquet_data(usage_path):
+        # Read static historical data
+        static_bronze = spark.read.parquet(str(usage_path))
+        
+        # Calculate daily cost per org/service/date to get daily grain stats
+        daily_costs_static = (
+            static_bronze
+            .withColumn("event_date", F.to_date("event_ts"))
+            .groupBy("event_date", "org_id", "service")
+            .agg(F.sum(F.coalesce(F.col("cost_usd_increment"), F.lit(0.0))).alias("daily_cost_usd"))
+        )
+        
+        # Compute mean and stddev of daily_cost_usd per service
+        service_stats = (
+            daily_costs_static
+            .groupBy("service")
+            .agg(
+                F.mean("daily_cost_usd").alias("service_mean_cost"),
+                F.stddev("daily_cost_usd").alias("service_stddev_cost")
+            )
+        )
+    else:
+        # Fallback if no parquet files are written yet
+        stats_schema = T.StructType([
+            T.StructField("service", T.StringType(), True),
+            T.StructField("service_mean_cost", T.DoubleType(), True),
+            T.StructField("service_stddev_cost", T.DoubleType(), True),
+        ])
+        service_stats = spark.createDataFrame([], schema=stats_schema)
+
+    df_features = (
         enriched_events
         .groupBy(F.window("event_ts", "1 day").alias("event_window"), "org_id", "service")
         .agg(
@@ -251,6 +321,16 @@ def build_daily_features(enriched_events: DataFrame, watermark_delay: str) -> Da
                     F.lit(0.0)
                 )
             ).alias("requests"),
+            F.sum(
+                F.when(F.col("metric") == F.lit("cpu_hours"), F.coalesce(F.col("value_num"), F.lit(0.0))).otherwise(
+                    F.lit(0.0)
+                )
+            ).alias("cpu_hours"),
+            F.sum(
+                F.when(F.col("metric") == F.lit("storage_gb_hours"), F.coalesce(F.col("value_num"), F.lit(0.0))).otherwise(
+                    F.lit(0.0)
+                )
+            ).alias("storage_gb_hours"),
             F.sum(F.coalesce(F.col("genai_tokens"), F.lit(0))).alias("genai_tokens_total"),
             F.sum(F.coalesce(F.col("carbon_kg"), F.lit(0.0))).alias("carbon_kg_total"),
             F.count(F.lit(1)).alias("events_count"),
@@ -261,8 +341,33 @@ def build_daily_features(enriched_events: DataFrame, watermark_delay: str) -> Da
         .withColumn("event_date", F.to_date(F.col("event_window.start")))
         .drop("event_window")
         .withColumn("requests", F.col("requests").cast("long"))
+        .withColumn("cpu_hours", F.col("cpu_hours").cast("double"))
+        .withColumn("storage_gb_hours", F.col("storage_gb_hours").cast("double"))
         .withColumn("genai_tokens_total", F.col("genai_tokens_total").cast("long"))
     )
+
+    # Left join streaming features with static stats
+    joined = df_features.join(service_stats, on="service", how="left")
+
+    # Calculate z-score and anomaly z-score flag (threshold abs(z_score) > 3.0)
+    result = (
+        joined
+        .withColumn(
+            "z_score",
+            F.when(
+                (F.col("service_stddev_cost").isNotNull()) & (F.col("service_stddev_cost") > 0.0),
+                (F.col("daily_cost_usd") - F.col("service_mean_cost")) / F.col("service_stddev_cost")
+            ).otherwise(F.lit(0.0))
+        )
+        .withColumn(
+            "anomaly_zscore_flag",
+            F.coalesce(F.abs(F.col("z_score")) > 3.0, F.lit(False))
+        )
+        .drop("service_mean_cost", "service_stddev_cost")
+    )
+    
+    return result
+
 
 
 def write_outputs(
@@ -391,7 +496,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     spark = build_spark("bronze_to_silver")
 
     try:
-        usage, customers = load_bronze_inputs(
+        usage, customers, users, resources = load_bronze_inputs(
             spark=spark,
             bronze_root=args.bronze_root,
             max_files_per_trigger=args.max_files_per_trigger,
@@ -405,7 +510,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             .dropDuplicates(["event_id"])
         )
 
-        enriched = enrich_with_master(deduped_silver_events, customers)
+        enriched = enrich_with_master(deduped_silver_events, customers, users, resources)
         features = build_daily_features(enriched, args.watermark_delay)
 
         trigger_builder = {"availableNow": True} if not args.continuous else {"processingTime": "30 seconds"}

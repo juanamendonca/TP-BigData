@@ -352,8 +352,6 @@ def parse_selected_tables(csv_text: str) -> List[str]:
     invalid = [name for name in names if name not in TABLES]
     if invalid:
         raise ValueError(f"Unknown table(s): {', '.join(invalid)}")
-    if len(names) < 3:
-        raise ValueError("Second partial requires at least 3 masters in batch Bronze.")
     return names
 
 

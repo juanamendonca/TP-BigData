@@ -1,6 +1,6 @@
-# TP-BigData - Segunda Entrega (MVP técnico)
+# TP-BigData - Entrega Final
 
-Objetivo de la entrega: demostrar el flujo end-to-end (Landing -> Bronze -> Silver -> Gold -> Serving).
+Objetivo de la entrega: demostrar el flujo end-to-end completo (Landing -> Bronze -> Silver -> Gold -> Serving).
 
 ## Instalación y Configuración
 
@@ -87,11 +87,10 @@ Asegurate de estar posicionado en la carpeta raíz del proyecto, con el entorno 
 
 ---
 
-### Paso 1 — Ingesta Batch a Bronze (Maestros)
-Procesa los archivos maestros desde `datalake/landing` hacia `datalake/bronze`:
+### Paso 1 — Ingesta Batch a Bronze (Todos los Maestros y Facturación)
+Procesa todos los archivos maestros y la facturación desde `datalake/landing` hacia `datalake/bronze`:
 ```bash
-python batch_landing_to_bronze.py --batch-date 2026-06-15 --tables customers_orgs,users,billing_monthly
-
+python batch_landing_to_bronze.py --batch-date 2026-06-15
 ```
 
 ---
@@ -104,7 +103,7 @@ python streaming_landing_to_bronze.py --watermark-delay "2 days" --max-files-per
 
 ---
 
-### Paso 3 — Conformance y Enriquecimiento a Silver
+### Paso 3 — Conformance y Enriquecimiento a Silver (Eventos)
 Limpia los tipos de datos, aplica reglas de calidad, maneja la cuarentena y genera features diarias:
 ```bash
 python bronze_to_silver.py --max-files-per-trigger 1000
@@ -112,10 +111,26 @@ python bronze_to_silver.py --max-files-per-trigger 1000
 
 ---
 
-### Paso 4 — Construcción del Mart a Gold
-Construye el mart de negocio FinOps agrupado a partir de las features agregadas:
+### Paso 3.5 — Ingesta y Limpieza Batch a Silver (Billing y Tickets)
+Limpia, normaliza monedas a USD y calcula agregaciones iniciales diarias de tickets:
+```bash
+python batch_bronze_to_silver.py
+```
+
+---
+
+### Paso 4 — Construcción de Marts a Gold (Streaming)
+Construye los 3 marts de negocio operacionales streaming (uso, GenAI y anomalías):
 ```bash
 python silver_to_gold.py --max-files-per-trigger 1000
+```
+
+---
+
+### Paso 4.5 — Agregaciones de Negocio a Gold (Batch)
+Construye la facturación mensual consolidada y la distribución de severidades diaria en colecciones Map:
+```bash
+python batch_silver_to_gold.py
 ```
 
 ---
@@ -129,10 +144,10 @@ Este paso requiere tener una base de datos activa. Elegí una de las siguientes 
 2. **Descargar Secure Connect Bundle:** Entrá a tu DB en el dashboard de Astra, ve a **Connect** > **Drivers** > **Python**, descargá el archivo ZIP `secure-connect-<db-name>.zip` y pegalo en la carpeta raíz del proyecto.
 3. **Generar Token:** En el panel de Astra ve a **Settings** > **Application Tokens** y generá un token con el rol **Database Administrator**. Copiá el token (formato: `AstraCS:...`).
 4. **Configurar archivo:** Copiá el template de configuración:
-   - *Windows:* `copy cassandra_config.example.json cassandra_config.json`
-   - *macOS/Linux:* `cp cassandra_config.example.json cassandra_config.json`
+   - *Windows:* `copy config\cassandra_config.example.json config\cassandra_config.json`
+   - *macOS/Linux:* `cp config/cassandra_config.example.json config/cassandra_config.json`
    
-   Editá `cassandra_config.json` con tu ZIP y token:
+   Editá `config/cassandra_config.json` con tu ZIP y token:
    ```json
    {
      "mode": "astradb",
@@ -144,9 +159,13 @@ Este paso requiere tener una base de datos activa. Elegí una de las siguientes 
      }
    }
    ```
-5. **Cargar y verificar:** Ejecutá la carga:
+5. **Cargar las 5 tablas:** Ejecutá la carga para cada uno de los 5 marts Gold:
    ```bash
-   python gold_to_serving_cassandra.py --write-serving --config cassandra_config.json
+   python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table org_daily_usage_by_service
+   python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table revenue_by_org_month
+   python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table tickets_by_org_date
+   python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table genai_tokens_by_org_date
+   python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table cost_anomaly_mart
    ```
    Verificá los resultados en la **CQL Console** de la web de Astra ejecutando las consultas en `cql/02_queries_finops.cql`.
 
@@ -158,7 +177,7 @@ Este paso requiere tener una base de datos activa. Elegí una de las siguientes 
 2. **Esperar inicio:** Esperá a que el contenedor esté listo (~30-60 segundos):
    - *Windows:* `docker logs cassandra-local 2>&1 | Select-String "Startup complete"`
    - *macOS/Linux:* `docker logs cassandra-local 2>&1 | grep "Startup complete"`
-3. **Configurar archivo:** Copiá el template de configuración (`cassandra_config.json`) y cambiá el modo a local:
+3. **Configurar archivo:** Copiá el template de configuración (`config/cassandra_config.json`) y cambiá el modo a local:
    ```json
    {
      "mode": "local",
@@ -170,9 +189,13 @@ Este paso requiere tener una base de datos activa. Elegí una de las siguientes 
      }
    }
    ```
-4. **Cargar y verificar:** Ejecutá la carga:
+4. **Cargar las 5 tablas:** Ejecutá la carga para cada uno de los 5 marts Gold:
    ```bash
-   python gold_to_serving_cassandra.py --write-serving --config cassandra_config.json
+   python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table org_daily_usage_by_service
+   python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table revenue_by_org_month
+   python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table tickets_by_org_date
+   python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table genai_tokens_by_org_date
+   python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table cost_anomaly_mart
    ```
    Para validar localmente, conectate a cqlsh:
    ```bash
@@ -183,7 +206,7 @@ Este paso requiere tener una base de datos activa. Elegí una de las siguientes 
 #### Validación automática de la Consulta #2 (Top-N acumulado)
 Para ver los resultados agrupados y ordenados de la consulta analítica #2 (Top-N servicios por costo acumulado en los últimos 14 días, tanto local como en AstraDB según tu configuración), ejecutá:
 ```bash
-python query2_top_n_demo.py --config cassandra_config.json
+python query2_top_n_demo.py --config config/cassandra_config.json
 ```
 
 ---
