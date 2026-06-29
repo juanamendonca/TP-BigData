@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Bronze -> Silver pipeline (Structured Streaming) for second partial point 3.
+Bronze -> Silver pipeline (Structured Streaming).
 
 Implements minimum Silver requirements:
 - Conformance and cleaning for usage events.
-- Enrichment join with one master table (customers_orgs).
+- Enrichment join with customers_orgs.
 - 3 active data-quality rules.
 - Quarantine dataset with samples of broken records.
 - At least 3 features (daily_cost_usd, requests, genai_tokens_total, carbon_kg_total).
@@ -83,6 +83,8 @@ def build_spark(app_name: str) -> SparkSession:
         .config("spark.executor.extraJavaOptions", "-Djava.security.manager=allow")
         .config("spark.hadoop.hadoop.security.authentication", "simple")
         .config("spark.sql.warehouse.dir", str(warehouse_dir))
+        .config("spark.hadoop.parquet.block.size", str(16 * 1024 * 1024))
+        .config("spark.hadoop.parquet.page.size", str(1 * 1024 * 1024))
         .getOrCreate()
     )
     spark.conf.set("spark.sql.session.timeZone", "UTC")
@@ -143,11 +145,9 @@ def load_bronze_inputs(
     spark: SparkSession,
     bronze_root: Path,
     max_files_per_trigger: int,
-) -> tuple[DataFrame, DataFrame, DataFrame, DataFrame]:
+) -> tuple[DataFrame, DataFrame]:
     usage_path = bronze_root / "streaming" / "usage_events"
     customers_path = bronze_root / "batch" / "customers_orgs"
-    users_path = bronze_root / "batch" / "users"
-    resources_path = bronze_root / "batch" / "resources"
 
     if not has_parquet_data(usage_path):
         raise FileNotFoundError(
@@ -170,17 +170,7 @@ def load_bronze_inputs(
         "hq_region",
         "is_enterprise",
     )
-    users = spark.read.parquet(str(users_path)).select(
-        "org_id",
-        "user_id",
-        "active",
-    )
-    resources = spark.read.parquet(str(resources_path)).select(
-        "resource_id",
-        "state",
-        "tags_json",
-    )
-    return usage, customers, users, resources
+    return usage, customers
 
 
 def prepare_events(usage: DataFrame) -> DataFrame:
@@ -251,28 +241,8 @@ def split_silver_and_quarantine(flagged: DataFrame) -> tuple[DataFrame, DataFram
 def enrich_with_master(
     silver_events: DataFrame,
     customers: DataFrame,
-    users: DataFrame,
-    resources: DataFrame,
 ) -> DataFrame:
-    # Pre-aggregate users per org to avoid cartesian product (since org has multiple users)
-    users_agg = users.groupBy("org_id").agg(
-        F.count("user_id").alias("total_org_users"),
-        F.sum(F.when(F.col("active") == True, F.lit(1)).otherwise(F.lit(0))).alias("active_org_users")
-    )
-    
-    # Rename resource columns to avoid collisions
-    resources_clean = resources.select(
-        F.col("resource_id"),
-        F.col("state").alias("resource_state"),
-        F.col("tags_json").alias("resource_tags_json")
-    )
-    
-    # Join with orgs (customers), users, and resources
-    enriched_orgs = silver_events.join(customers, on="org_id", how="left")
-    enriched_users = enriched_orgs.join(users_agg, on="org_id", how="left")
-    enriched_all = enriched_users.join(resources_clean, on="resource_id", how="left")
-    
-    return enriched_all
+    return silver_events.join(F.broadcast(customers), on="org_id", how="left")
 
 
 def build_daily_features(enriched_events: DataFrame, watermark_delay: str) -> DataFrame:
@@ -496,7 +466,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     spark = build_spark("bronze_to_silver")
 
     try:
-        usage, customers, users, resources = load_bronze_inputs(
+        usage, customers = load_bronze_inputs(
             spark=spark,
             bronze_root=args.bronze_root,
             max_files_per_trigger=args.max_files_per_trigger,
@@ -510,7 +480,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             .dropDuplicates(["event_id"])
         )
 
-        enriched = enrich_with_master(deduped_silver_events, customers, users, resources)
+        enriched = enrich_with_master(deduped_silver_events, customers)
         features = build_daily_features(enriched, args.watermark_delay)
 
         trigger_builder = {"availableNow": True} if not args.continuous else {"processingTime": "30 seconds"}

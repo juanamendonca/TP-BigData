@@ -6,8 +6,9 @@ This script:
 - Supports 5 Gold marts (both batch and streaming grain).
 - Generates CQL DDL and 5 analytical queries.
 - Runs schema initialization (DDL) for all tables on the Driver.
-- Writes streaming marts using Spark Structured Streaming + foreachBatch + foreachPartition.
-- Writes batch marts using static Spark read + RDD foreachPartition.
+- Writes streaming marts using Spark Structured Streaming + foreachBatch.
+- Writes batch marts using static Spark read.
+- Supports driver writes for local stability and executor writes for larger loads.
 - Supports AstraDB cloud and local Docker modes.
 """
 
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import socket
+from functools import partial
 from pathlib import Path
 from typing import List, Optional
 
@@ -130,7 +132,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--continuous",
         action="store_true",
-        help="Keep streaming query running continuously. Default runs trigger once and exits.",
+        help="Keep streaming query running continuously. Default drains backlog with availableNow micro-batches.",
+    )
+    parser.add_argument(
+        "--write-mode",
+        choices=["driver", "executor"],
+        default="driver",
+        help=(
+            "Cassandra write execution mode. 'driver' is stable for local/TP-sized data; "
+            "'executor' uses Spark foreachPartition for larger loads."
+        ),
     )
     parser.add_argument(
         "--config",
@@ -413,13 +424,19 @@ def initialize_cassandra_schema(host: Optional[str], port: int, username: Option
     cluster.shutdown()
 
 
-def build_partition_writer(host: Optional[str], port: int, username: Optional[str], password: Optional[str],
-                           keyspace: str, table: str,
-                           astradb_bundle: Optional[str] = None, astradb_token: Optional[str] = None):
-    def write_partition(rows):
-        cluster = _build_cluster(host, port, username, password, astradb_bundle, astradb_token)
-        session = cluster.connect(keyspace)
+def write_cassandra_rows(rows, connection: dict) -> None:
+    cluster = _build_cluster(
+        connection["host"],
+        connection["port"],
+        connection["username"],
+        connection["password"],
+        connection["astradb_bundle"],
+        connection["astradb_token"],
+    )
+    session = cluster.connect(connection["keyspace"])
+    table = connection["table"]
 
+    try:
         if table == "org_daily_usage_by_service":
             prepared = session.prepare(
                 f"""
@@ -543,11 +560,25 @@ def build_partition_writer(host: Optional[str], port: int, username: Optional[st
                         bool(row["anomaly_zscore_flag"]) if row["anomaly_zscore_flag"] is not None else None,
                     ),
                 )
-
+    finally:
         session.shutdown()
         cluster.shutdown()
 
-    return write_partition
+
+def build_partition_writer(host: Optional[str], port: int, username: Optional[str], password: Optional[str],
+                           keyspace: str, table: str,
+                           astradb_bundle: Optional[str] = None, astradb_token: Optional[str] = None):
+    connection = {
+        "host": host,
+        "port": port,
+        "username": username,
+        "password": password,
+        "keyspace": keyspace,
+        "table": table,
+        "astradb_bundle": astradb_bundle,
+        "astradb_token": astradb_token,
+    }
+    return partial(write_cassandra_rows, connection=connection)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -618,8 +649,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[ERROR] Failed to initialize Cassandra schema from Driver: {exc}")
             return 2
 
-        # Create closure partition writer function for this specific table
-        partition_writer = build_partition_writer(
+        # Driver mode is stable for local/TP-sized data. Executor mode parallelizes
+        # Cassandra writes with foreachPartition for larger loads.
+        row_writer = build_partition_writer(
             host=args.host,
             port=args.port,
             username=args.username,
@@ -631,6 +663,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
 
         is_batch_table = args.table in ("revenue_by_org_month", "tickets_by_org_date")
+        print(f"[INFO] Cassandra write mode: {args.write_mode}")
 
         if is_batch_table:
             print(f"[INFO] Table '{args.table}' is BATCH. Reading Gold parquet statically...")
@@ -639,7 +672,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             rows = gold_df.count()
             print(f"[INFO] Processing static table '{args.table}' (rows: {rows})")
             if rows > 0:
-                gold_df.rdd.foreachPartition(partition_writer)
+                if args.write_mode == "executor":
+                    gold_df.rdd.foreachPartition(row_writer)
+                else:
+                    row_writer(gold_df.toLocalIterator())
             gold_df.unpersist()
             print(f"[OK] Batch load to Cassandra table '{args.table}' completed successfully.")
         else:
@@ -651,12 +687,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                 rows = batch_df.count()
                 print(f"[INFO] Processing micro-batch {batch_id} (rows: {rows})")
                 if rows > 0:
-                    batch_df.rdd.foreachPartition(partition_writer)
+                    if args.write_mode == "executor":
+                        batch_df.rdd.foreachPartition(row_writer)
+                    else:
+                        row_writer(batch_df.toLocalIterator())
                 batch_df.unpersist()
 
             mode_str = "astradb" if using_astra else "local"
             checkpoint_dir = args.checkpoint_root / f"gold_to_serving_{mode_str}" / args.table
-            trigger_builder = {"once": True} if not args.continuous else {"processingTime": "30 seconds"}
+            trigger_builder = {"availableNow": True} if not args.continuous else {"processingTime": "30 seconds"}
 
             print(f"[INFO] Starting serving stream write to Cassandra Keyspace: '{args.keyspace}' Table: '{args.table}'")
             query = (

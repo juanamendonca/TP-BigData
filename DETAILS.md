@@ -69,12 +69,9 @@ Parquet Bronze por tabla:
 #### A. Pipeline de Streaming (Eventos de Uso)
 **Script principal:** `bronze_to_silver.py`
 
-- Lee eventos desde Bronze streaming con `readStream` y 3 tablas maestras desde Bronze batch (`customers_orgs`, `users`, y `resources`).
+- Lee eventos desde Bronze streaming con `readStream` y la dimensión `customers_orgs` desde Bronze batch.
 - Aplica limpieza/conformance de tipos y campos (`event_ts`, `value_num`, `metric`, `unit`, costos).
-- Aplica joins de enriquecimiento multi-tabla:
-  - Join con `customers_orgs` por `org_id` (datos de organización).
-  - Join con `users` pre-agrupados por `org_id` (para obtener `total_org_users` y `active_org_users` sin duplicar filas del stream de eventos).
-  - Join con `resources` por `resource_id` (trayendo `resource_state` y `resource_tags_json`).
+- Aplica join de enriquecimiento con `customers_orgs` por `org_id` para sumar contexto de organización sin modificar el grano evento.
 - Activa reglas de calidad:
   - `event_id` no nulo y único.
   - `cost_usd_increment >= -0.01` (se mantiene en Silver con `anomaly_cost_flag`).
@@ -216,6 +213,5 @@ Las consultas se validaron directamente en Cassandra local (`cqlsh`). Los result
 3. **Cálculo de Anomalías con Z-Score**: Se implementó la detección estadística de anomalías de costo calculando el Z-Score por servicio. Para resolver la limitación de Structured Streaming sobre operaciones de ventana dinámicas complejas, se adoptó el patrón **Static-to-Stream Join**, donde las métricas de media y desviación estándar de referencia se calculan estáticamente a partir de los datos acumulados en Bronze y se cruzan con el stream en tiempo real.
 4. **Idempotencia basada en Upserts de Cassandra**: Al diseñar las tablas con claves de partición naturales (`org_id`, `month_bucket`, `event_date`, `service`), cualquier ejecución repetida de los pipelines simplemente actualiza los valores existentes en lugar de duplicar registros, garantizando la idempotencia completa de punta a punta.
 5. **Separación de Serving Batch vs Streaming**: Para los pipelines batch de Serving, el uso de Spark Structured Streaming con parquet file source generaría checkpoints innecesarios y una simulación continua ineficiente sobre tablas estáticas. Se resolvió la carga mediante `spark.read` estático acoplado a escrituras mediante `RDD.foreachPartition` directamente a Cassandra, mejorando el consumo de recursos.
-6. **Enriquecimiento Multi-Tabla en Streaming sin Duplicados**: Para realizar los joins obligatorios con `orgs`, `users` y `resources`, se pre-agruparon los datos de `users` estáticamente por `org_id` antes del join, calculando métricas a nivel org (`total_org_users`, `active_org_users`). Esto evita el producto cartesiano y mantiene la unicidad y consistencia de los eventos de uso en el stream. Los recursos se unieron directamente por la clave primaria `resource_id`.
+6. **Enriquecimiento acotado al alcance de serving**: El stream de eventos se enriquece con `customers_orgs` por `org_id`, manteniendo el grano evento y evitando columnas que no alimentan las consultas mínimas de Cassandra. `users` y `resources` se conservan en Bronze como maestros disponibles, pero no se incorporan al mart operativo porque no son necesarios para costos, requests, revenue, tickets ni tokens GenAI.
 7. **Cálculo de CPU y Storage Hours**: Se agregaron las columnas `cpu_hours` y `storage_gb_hours` al mart Gold operativo diario mediante el mapeo selectivo de las métricas correspondientes en la agregación por ventana diaria de PySpark, cubriendo la totalidad de las métricas de uso requeridas por el enunciado.
-

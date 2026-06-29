@@ -55,10 +55,10 @@ def build_spark(app_name: str) -> SparkSession:
     warehouse_dir = (Path.cwd() / "datalake" / "_spark_warehouse").resolve()
     spark = (
         SparkSession.builder.appName(app_name)
-        .config("spark.driver.extraJavaOptions", "-Djava.security.manager=allow")
-        .config("spark.executor.extraJavaOptions", "-Djava.security.manager=allow")
         .config("spark.hadoop.hadoop.security.authentication", "simple")
         .config("spark.sql.warehouse.dir", str(warehouse_dir))
+        .config("spark.hadoop.parquet.block.size", str(16 * 1024 * 1024))
+        .config("spark.hadoop.parquet.page.size", str(1 * 1024 * 1024))
         .getOrCreate()
     )
     spark.conf.set("spark.sql.session.timeZone", "UTC")
@@ -230,11 +230,15 @@ def write_manifest(gold_root: Path, stats: GoldStats, started_at: str, finished_
         "metrics": [
             "daily_cost_usd",
             "requests",
+            "cpu_hours",
+            "storage_gb_hours",
             "genai_tokens_total",
             "carbon_kg_total",
             "events_count",
             "anomaly_events_count",
             "quality_score",
+            "z_score",
+            "anomaly_zscore_flag",
         ],
     }
 

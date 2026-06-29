@@ -197,6 +197,8 @@ Este paso requiere tener una base de datos activa. Elegí una de las siguientes 
    python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table genai_tokens_by_org_date
    python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table cost_anomaly_mart
    ```
+   Para probar escritura paralela en datasets grandes, agregá `--write-mode executor` al comando correspondiente. Por default se escribe con driver, dado que en este proyecto se está trabajando con volumenes pequeños.
+   
    Para validar localmente, conectate a cqlsh:
    ```bash
    docker exec -it cassandra-local cqlsh
@@ -211,9 +213,26 @@ python query2_top_n_demo.py --config config/cassandra_config.json
 
 ---
 
+
+### Script Flujo Streaming Completo
+Ejecuta de punta a punta el flujo de eventos streaming y valida las 3 tablas Cassandra asociadas (`org_daily_usage_by_service`, `cost_anomaly_mart`, `genai_tokens_by_org_date`):
+```bash
+python run_streaming_flow.py --config config/cassandra_config.json --max-files-per-trigger 100
+```
+
+El script corre, en orden:
+1. `streaming_landing_to_bronze.py`
+2. `bronze_to_silver.py`
+3. `silver_to_gold.py`
+4. `gold_to_serving_cassandra.py` para las 3 tablas streaming
+5. Las consultas de verificación equivalentes a `cql/02_queries_finops.cql`
+
+Por defecto usa `--write-mode driver` para Cassandra. Para probar escritura paralela:
+```bash
+python run_streaming_flow.py --config config/cassandra_config.json --write-mode executor
+
 ## Arquitectura y Detalles del Diseño
 
 Para leer en detalle el comportamiento de cada script, las salidas esperadas en disco, la validación de las reglas de calidad y el log con las decisiones de diseño arquitectónico de cada capa, consultá la documentación técnica:
 
 **[DETAILS.md](DETAILS.md)**
-
