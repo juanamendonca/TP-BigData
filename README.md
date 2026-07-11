@@ -230,6 +230,20 @@ El script corre, en orden:
 Por defecto usa `--write-mode driver` para Cassandra. Para probar escritura paralela:
 ```bash
 python run_streaming_flow.py --config config/cassandra_config.json --write-mode executor
+```
+
+### Script Flujo Batch Completo
+Ejecuta de punta a punta el flujo batch y valida las 2 tablas Cassandra asociadas (`revenue_by_org_month`, `tickets_by_org_date`):
+```bash
+python run_batch_flow.py --config config/cassandra_config.json --batch-date 2026-06-15
+```
+
+El script corre, en orden:
+1. `batch_landing_to_bronze.py`
+2. `batch_bronze_to_silver.py`
+3. `batch_silver_to_gold.py`
+4. `gold_to_serving_cassandra.py` para las 2 tablas batch
+5. Las consultas de verificación de revenue mensual y tickets diarios
 
 ## Arquitectura y Detalles del Diseño
 
