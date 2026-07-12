@@ -15,7 +15,7 @@ Para ver las instrucciones de instalación y los comandos de ejecución, consult
 ## 1. Detalles Técnicos de las Capas
 
 ### Parte 1: Ingesta Batch -> Bronze (PySpark)
-**Script principal:** `batch_landing_to_bronze.py`
+**Script principal:** `scripts/batch-flow/batch_landing_to_bronze.py`
 
 #### Qué hace el script:
 - Lee los maestros CSV desde `datalake/landing` con esquema explícito (sin inferencia): `customers_orgs`, `users`, `billing_monthly`, y `support_tickets`.
@@ -42,7 +42,7 @@ Parquet Bronze por tabla:
 ---
 
 ### Parte 2: Ingesta Streaming -> Bronze (Structured Streaming)
-**Script principal:** `streaming_landing_to_bronze.py`
+**Script principal:** `scripts/streaming-flow/streaming_landing_to_bronze.py`
 
 #### Qué hace el script:
 - Lee `usage_events_stream/*.jsonl` con Structured Streaming.
@@ -67,7 +67,7 @@ Parquet Bronze por tabla:
 ### Parte 3: Bronze -> Silver
 
 #### A. Pipeline de Streaming (Eventos de Uso)
-**Script principal:** `bronze_to_silver.py`
+**Script principal:** `scripts/streaming-flow/streaming_bronze_to_silver.py`
 
 - Lee eventos desde Bronze streaming con `readStream` y la dimensión `customers_orgs` desde Bronze batch.
 - Aplica limpieza/conformance de tipos y campos (`event_ts`, `value_num`, `metric`, `unit`, costos).
@@ -93,7 +93,7 @@ Parquet Bronze por tabla:
 - Checkpoints: `datalake/checkpoints/bronze_to_silver/`
 
 #### B. Pipeline Batch (Facturación y Soporte)
-**Script principal:** `batch_bronze_to_silver.py`
+**Script principal:** `scripts/batch-flow/batch_bronze_to_silver.py`
 
 - Lee los datasets `billing_monthly` y `support_tickets` de la capa Bronze batch.
 - **Para Facturación (Billing)**:
@@ -113,7 +113,7 @@ Parquet Bronze por tabla:
 ### Parte 4: Silver -> Gold
 
 #### A. Pipeline de Streaming (Marts Operativos)
-**Script principal:** `silver_to_gold.py`
+**Script principal:** `scripts/streaming-flow/streaming_silver_to_gold.py`
 
 Lee de forma incremental `silver/features_org_daily` para generar 3 marts de Gold en paralelo:
 1. **org_daily_usage_by_service**: Grano diario por org/servicio con costos, requests, GenAI tokens, huella de carbono y scores de calidad.
@@ -124,7 +124,7 @@ Lee de forma incremental `silver/features_org_daily` para generar 3 marts de Gol
    - Path: `datalake/gold/cost_anomaly_mart/`
 
 #### B. Pipeline Batch (Marts de Negocio y Soporte)
-**Script principal:** `batch_silver_to_gold.py`
+**Script principal:** `scripts/batch-flow/batch_silver_to_gold.py`
 
 Procesa los datasets normalizados de Silver batch de forma estática:
 1. **revenue_by_org_month**: Agrupa la facturación a grano mensual por organización.
@@ -139,15 +139,15 @@ Procesa los datasets normalizados de Silver batch de forma estática:
 ---
 
 ### Parte 5: Gold -> Serving (Cassandra)
-**Scripts principales:** `streaming_gold_to_serving_cassandra.py` y `batch_gold_to_serving_cassandra.py`
+**Scripts principales:** `scripts/streaming-flow/streaming_gold_to_serving_cassandra.py` y `scripts/batch-flow/batch_gold_to_serving_cassandra.py`
 
 #### Qué hacen los scripts:
 - Se conecta a la base de datos (soporta conexión local Docker `cassandra-local` o AstraDB Cloud).
 - Ejecuta la creación del Keyspace y las 5 tablas DDL siguiendo el diseño **Query-First** en el Driver de Spark.
 - Genera los artefactos CQL en la carpeta `cql/`.
 - Cargan los 5 marts Gold de forma idempotente (UPSERTS por clave primaria):
-  - **Streaming Marts** (`org_daily_usage_by_service`, `genai_tokens_by_org_date`, `cost_anomaly_mart`): `streaming_gold_to_serving_cassandra.py` usa `writeStream` con `foreachBatch` para escribir micro-lotes directamente.
-  - **Batch Marts** (`revenue_by_org_month`, `tickets_by_org_date`): `batch_gold_to_serving_cassandra.py` lee Parquet estáticamente y escribe sin checkpoints.
+  - **Streaming Marts** (`org_daily_usage_by_service`, `genai_tokens_by_org_date`, `cost_anomaly_mart`): `scripts/streaming-flow/streaming_gold_to_serving_cassandra.py` usa `writeStream` con `foreachBatch` para escribir micro-lotes directamente.
+  - **Batch Marts** (`revenue_by_org_month`, `tickets_by_org_date`): `scripts/batch-flow/batch_gold_to_serving_cassandra.py` lee Parquet estáticamente y escribe sin checkpoints.
 
 ---
 

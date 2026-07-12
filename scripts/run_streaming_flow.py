@@ -27,6 +27,9 @@ STREAMING_SERVING_TABLES = [
     "genai_tokens_by_org_date",
 ]
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+STREAMING_FLOW_DIR = Path(__file__).resolve().parent / "streaming-flow"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run streaming pipeline and Cassandra verification queries.")
@@ -63,7 +66,7 @@ def parse_args() -> argparse.Namespace:
 
 def run_step(command: list[str], env: dict[str, str]) -> None:
     print("\n[RUN] " + " ".join(command), flush=True)
-    subprocess.run(command, check=True, env=env)
+    subprocess.run(command, check=True, env=env, cwd=PROJECT_ROOT)
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -182,8 +185,10 @@ def run_verification_queries(cfg: dict[str, Any], args: argparse.Namespace) -> N
 
 
 def main() -> int:
+    os.chdir(PROJECT_ROOT)
     args = parse_args()
-    if not args.config.exists():
+    config_path = args.config if args.config.is_absolute() else PROJECT_ROOT / args.config
+    if not config_path.exists():
         print(f"[ERROR] Config not found: {args.config}", file=sys.stderr)
         return 2
 
@@ -193,7 +198,7 @@ def main() -> int:
     run_step(
         [
             python,
-            "streaming_landing_to_bronze.py",
+            str(STREAMING_FLOW_DIR / "streaming_landing_to_bronze.py"),
             "--watermark-delay",
             args.watermark_delay,
             "--max-files-per-trigger",
@@ -204,7 +209,7 @@ def main() -> int:
     run_step(
         [
             python,
-            "bronze_to_silver.py",
+            str(STREAMING_FLOW_DIR / "streaming_bronze_to_silver.py"),
             "--watermark-delay",
             args.watermark_delay,
             "--max-files-per-trigger",
@@ -215,7 +220,7 @@ def main() -> int:
     run_step(
         [
             python,
-            "silver_to_gold.py",
+            str(STREAMING_FLOW_DIR / "streaming_silver_to_gold.py"),
             "--max-files-per-trigger",
             str(args.max_files_per_trigger),
         ],
@@ -226,10 +231,10 @@ def main() -> int:
         run_step(
             [
                 python,
-                "streaming_gold_to_serving_cassandra.py",
+                str(STREAMING_FLOW_DIR / "streaming_gold_to_serving_cassandra.py"),
                 "--write-serving",
                 "--config",
-                str(args.config),
+                str(config_path),
                 "--table",
                 table,
                 "--write-mode",
@@ -238,7 +243,7 @@ def main() -> int:
             env,
         )
 
-    run_verification_queries(load_config(args.config), args)
+    run_verification_queries(load_config(config_path), args)
     print("\n[OK] Streaming flow completed end-to-end.")
     return 0
 

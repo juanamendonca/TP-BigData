@@ -25,6 +25,9 @@ BATCH_SERVING_TABLES = [
     "tickets_by_org_date",
 ]
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+BATCH_FLOW_DIR = Path(__file__).resolve().parent / "batch-flow"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run batch pipeline and Cassandra verification queries.")
@@ -79,7 +82,7 @@ def parse_args() -> argparse.Namespace:
 
 def run_step(command: list[str], env: dict[str, str]) -> None:
     print("\n[RUN] " + " ".join(command), flush=True)
-    subprocess.run(command, check=True, env=env)
+    subprocess.run(command, check=True, env=env, cwd=PROJECT_ROOT)
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -180,8 +183,10 @@ def run_verification_queries(cfg: dict[str, Any], args: argparse.Namespace) -> N
 
 
 def main() -> int:
+    os.chdir(PROJECT_ROOT)
     args = parse_args()
-    if not args.config.exists():
+    config_path = args.config if args.config.is_absolute() else PROJECT_ROOT / args.config
+    if not config_path.exists():
         print(f"[ERROR] Config not found: {args.config}", file=sys.stderr)
         return 2
 
@@ -191,7 +196,7 @@ def main() -> int:
     run_step(
         [
             python,
-            "batch_landing_to_bronze.py",
+            str(BATCH_FLOW_DIR / "batch_landing_to_bronze.py"),
             "--landing-root",
             str(args.landing_root),
             "--bronze-root",
@@ -204,7 +209,7 @@ def main() -> int:
     run_step(
         [
             python,
-            "batch_bronze_to_silver.py",
+            str(BATCH_FLOW_DIR / "batch_bronze_to_silver.py"),
             "--bronze-root",
             str(args.bronze_root),
             "--silver-root",
@@ -215,7 +220,7 @@ def main() -> int:
     run_step(
         [
             python,
-            "batch_silver_to_gold.py",
+            str(BATCH_FLOW_DIR / "batch_silver_to_gold.py"),
             "--silver-root",
             str(args.silver_root),
             "--gold-root",
@@ -228,10 +233,10 @@ def main() -> int:
         run_step(
             [
                 python,
-                "batch_gold_to_serving_cassandra.py",
+                str(BATCH_FLOW_DIR / "batch_gold_to_serving_cassandra.py"),
                 "--write-serving",
                 "--config",
-                str(args.config),
+                str(config_path),
                 "--gold-root",
                 str(args.gold_root),
                 "--table",
@@ -242,7 +247,7 @@ def main() -> int:
             env,
         )
 
-    run_verification_queries(load_config(args.config), args)
+    run_verification_queries(load_config(config_path), args)
     print("\n[OK] Batch flow completed end-to-end.")
     return 0
 

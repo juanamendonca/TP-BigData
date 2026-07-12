@@ -90,7 +90,7 @@ Asegurate de estar posicionado en la carpeta raíz del proyecto, con el entorno 
 ### Paso 1 — Ingesta Batch a Bronze (Todos los Maestros y Facturación)
 Procesa todos los archivos maestros y la facturación desde `datalake/landing` hacia `datalake/bronze`:
 ```bash
-python batch_landing_to_bronze.py --batch-date 2026-06-15
+python scripts/batch-flow/batch_landing_to_bronze.py --batch-date 2026-06-15
 ```
 
 ---
@@ -98,7 +98,7 @@ python batch_landing_to_bronze.py --batch-date 2026-06-15
 ### Paso 2 — Ingesta Streaming a Bronze (Eventos de uso)
 Lee incrementalmente los eventos de uso y genera la capa Bronze con watermarks:
 ```bash
-python streaming_landing_to_bronze.py --watermark-delay "2 days" --max-files-per-trigger 50
+python scripts/streaming-flow/streaming_landing_to_bronze.py --watermark-delay "2 days" --max-files-per-trigger 50
 ```
 
 ---
@@ -106,7 +106,7 @@ python streaming_landing_to_bronze.py --watermark-delay "2 days" --max-files-per
 ### Paso 3 — Conformance y Enriquecimiento a Silver (Eventos)
 Limpia los tipos de datos, aplica reglas de calidad, maneja la cuarentena y genera features diarias:
 ```bash
-python bronze_to_silver.py --max-files-per-trigger 1000
+python scripts/streaming-flow/streaming_bronze_to_silver.py --max-files-per-trigger 1000
 ```
 
 ---
@@ -114,7 +114,7 @@ python bronze_to_silver.py --max-files-per-trigger 1000
 ### Paso 3.5 — Ingesta y Limpieza Batch a Silver (Billing y Tickets)
 Limpia, normaliza monedas a USD y calcula agregaciones iniciales diarias de tickets:
 ```bash
-python batch_bronze_to_silver.py
+python scripts/batch-flow/batch_bronze_to_silver.py
 ```
 
 ---
@@ -122,7 +122,7 @@ python batch_bronze_to_silver.py
 ### Paso 4 — Construcción de Marts a Gold (Streaming)
 Construye los 3 marts de negocio operacionales streaming (uso, GenAI y anomalías):
 ```bash
-python silver_to_gold.py --max-files-per-trigger 1000
+python scripts/streaming-flow/streaming_silver_to_gold.py --max-files-per-trigger 1000
 ```
 
 ---
@@ -130,7 +130,7 @@ python silver_to_gold.py --max-files-per-trigger 1000
 ### Paso 4.5 — Agregaciones de Negocio a Gold (Batch)
 Construye la facturación mensual consolidada y la distribución de severidades diaria en colecciones Map:
 ```bash
-python batch_silver_to_gold.py
+python scripts/batch-flow/batch_silver_to_gold.py
 ```
 
 ---
@@ -159,13 +159,13 @@ Este paso requiere tener una base de datos activa. Elegí una de las siguientes 
      }
    }
    ```
-5. **Cargar las 5 tablas:** Ejecutá la carga para cada uno de los 5 marts Gold. Las tablas streaming usan `streaming_gold_to_serving_cassandra.py`; las tablas batch usan `batch_gold_to_serving_cassandra.py`:
+5. **Cargar las 5 tablas:** Ejecutá la carga para cada uno de los 5 marts Gold. Las tablas streaming usan `scripts/streaming-flow/streaming_gold_to_serving_cassandra.py`; las tablas batch usan `scripts/batch-flow/batch_gold_to_serving_cassandra.py`:
    ```bash
-   python streaming_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table org_daily_usage_by_service
-   python streaming_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table cost_anomaly_mart
-   python streaming_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table genai_tokens_by_org_date
-   python batch_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table revenue_by_org_month
-   python batch_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table tickets_by_org_date
+   python scripts/streaming-flow/streaming_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table org_daily_usage_by_service
+   python scripts/streaming-flow/streaming_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table cost_anomaly_mart
+   python scripts/streaming-flow/streaming_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table genai_tokens_by_org_date
+   python scripts/batch-flow/batch_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table revenue_by_org_month
+   python scripts/batch-flow/batch_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table tickets_by_org_date
    ```
    Verificá los resultados en la **CQL Console** de la web de Astra ejecutando las consultas en `cql/02_queries_finops.cql`.
 
@@ -189,13 +189,13 @@ Este paso requiere tener una base de datos activa. Elegí una de las siguientes 
      }
    }
    ```
-4. **Cargar las 5 tablas:** Ejecutá la carga para cada uno de los 5 marts Gold. Las tablas streaming usan `streaming_gold_to_serving_cassandra.py`; las tablas batch usan `batch_gold_to_serving_cassandra.py`:
+4. **Cargar las 5 tablas:** Ejecutá la carga para cada uno de los 5 marts Gold. Las tablas streaming usan `scripts/streaming-flow/streaming_gold_to_serving_cassandra.py`; las tablas batch usan `scripts/batch-flow/batch_gold_to_serving_cassandra.py`:
    ```bash
-   python streaming_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table org_daily_usage_by_service
-   python streaming_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table cost_anomaly_mart
-   python streaming_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table genai_tokens_by_org_date
-   python batch_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table revenue_by_org_month
-   python batch_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table tickets_by_org_date
+   python scripts/streaming-flow/streaming_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table org_daily_usage_by_service
+   python scripts/streaming-flow/streaming_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table cost_anomaly_mart
+   python scripts/streaming-flow/streaming_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table genai_tokens_by_org_date
+   python scripts/batch-flow/batch_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table revenue_by_org_month
+   python scripts/batch-flow/batch_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table tickets_by_org_date
    ```
    Para probar escritura paralela en datasets grandes, agregá `--write-mode executor` al comando correspondiente. Por default se escribe con driver, dado que en este proyecto se está trabajando con volumenes pequeños.
    
@@ -217,32 +217,32 @@ python query2_top_n_demo.py --config config/cassandra_config.json
 ### Script Flujo Streaming Completo
 Ejecuta de punta a punta el flujo de eventos streaming y valida las 3 tablas Cassandra asociadas (`org_daily_usage_by_service`, `cost_anomaly_mart`, `genai_tokens_by_org_date`):
 ```bash
-python run_streaming_flow.py --config config/cassandra_config.json --max-files-per-trigger 100
+python scripts/run_streaming_flow.py --config config/cassandra_config.json --max-files-per-trigger 100
 ```
 
 El script corre, en orden:
-1. `streaming_landing_to_bronze.py`
-2. `bronze_to_silver.py`
-3. `silver_to_gold.py`
-4. `streaming_gold_to_serving_cassandra.py` para las 3 tablas streaming
+1. `scripts/streaming-flow/streaming_landing_to_bronze.py`
+2. `scripts/streaming-flow/streaming_bronze_to_silver.py`
+3. `scripts/streaming-flow/streaming_silver_to_gold.py`
+4. `scripts/streaming-flow/streaming_gold_to_serving_cassandra.py` para las 3 tablas streaming
 5. Las consultas de verificación equivalentes a `cql/02_queries_finops.cql`
 
 Por defecto usa `--write-mode driver` para Cassandra. Para probar escritura paralela:
 ```bash
-python run_streaming_flow.py --config config/cassandra_config.json --write-mode executor
+python scripts/run_streaming_flow.py --config config/cassandra_config.json --write-mode executor
 ```
 
 ### Script Flujo Batch Completo
 Ejecuta de punta a punta el flujo batch y valida las 2 tablas Cassandra asociadas (`revenue_by_org_month`, `tickets_by_org_date`):
 ```bash
-python run_batch_flow.py --config config/cassandra_config.json --batch-date 2026-06-15
+python scripts/run_batch_flow.py --config config/cassandra_config.json --batch-date 2026-06-15
 ```
 
 El script corre, en orden:
-1. `batch_landing_to_bronze.py`
-2. `batch_bronze_to_silver.py`
-3. `batch_silver_to_gold.py`
-4. `batch_gold_to_serving_cassandra.py` para las 2 tablas batch
+1. `scripts/batch-flow/batch_landing_to_bronze.py`
+2. `scripts/batch-flow/batch_bronze_to_silver.py`
+3. `scripts/batch-flow/batch_silver_to_gold.py`
+4. `scripts/batch-flow/batch_gold_to_serving_cassandra.py` para las 2 tablas batch
 5. Las consultas de verificación de revenue mensual y tickets diarios
 
 ## Arquitectura y Detalles del Diseño
