@@ -139,15 +139,15 @@ Procesa los datasets normalizados de Silver batch de forma estática:
 ---
 
 ### Parte 5: Gold -> Serving (Cassandra)
-**Script principal:** `gold_to_serving_cassandra.py`
+**Scripts principales:** `streaming_gold_to_serving_cassandra.py` y `batch_gold_to_serving_cassandra.py`
 
-#### Qué hace el script:
+#### Qué hacen los scripts:
 - Se conecta a la base de datos (soporta conexión local Docker `cassandra-local` o AstraDB Cloud).
 - Ejecuta la creación del Keyspace y las 5 tablas DDL siguiendo el diseño **Query-First** en el Driver de Spark.
 - Genera los artefactos CQL en la carpeta `cql/`.
-- Carga los 5 marts Gold de forma idempotente (UPSERTS por clave primaria):
-  - **Streaming Marts** (`org_daily_usage_by_service`, `genai_tokens_by_org_date`, `cost_anomaly_mart`): Utilizan `writeStream` con `foreachBatch` para escribir micro-lotes directamente.
-  - **Batch Marts** (`revenue_by_org_month`, `tickets_by_org_date`): Se leen estáticamente y se escriben por partición de RDD (`rdd.foreachPartition`) para evitar checkpoints inútiles.
+- Cargan los 5 marts Gold de forma idempotente (UPSERTS por clave primaria):
+  - **Streaming Marts** (`org_daily_usage_by_service`, `genai_tokens_by_org_date`, `cost_anomaly_mart`): `streaming_gold_to_serving_cassandra.py` usa `writeStream` con `foreachBatch` para escribir micro-lotes directamente.
+  - **Batch Marts** (`revenue_by_org_month`, `tickets_by_org_date`): `batch_gold_to_serving_cassandra.py` lee Parquet estáticamente y escribe sin checkpoints.
 
 ---
 

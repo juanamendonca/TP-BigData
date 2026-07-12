@@ -167,7 +167,6 @@ Este paso requiere tener una base de datos activa. Elegí una de las siguientes 
    python batch_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table revenue_by_org_month
    python batch_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table tickets_by_org_date
    ```
-   `gold_to_serving_cassandra.py` queda disponible como wrapper de compatibilidad para comandos anteriores.
    Verificá los resultados en la **CQL Console** de la web de Astra ejecutando las consultas en `cql/02_queries_finops.cql`.
 
 #### Opción B — Cassandra Local con Docker
@@ -198,7 +197,6 @@ Este paso requiere tener una base de datos activa. Elegí una de las siguientes 
    python batch_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table revenue_by_org_month
    python batch_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table tickets_by_org_date
    ```
-   `gold_to_serving_cassandra.py` queda disponible como wrapper de compatibilidad para comandos anteriores.
    Para probar escritura paralela en datasets grandes, agregá `--write-mode executor` al comando correspondiente. Por default se escribe con driver, dado que en este proyecto se está trabajando con volumenes pequeños.
    
    Para validar localmente, conectate a cqlsh:

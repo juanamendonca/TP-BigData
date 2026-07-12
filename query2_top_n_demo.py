@@ -2,7 +2,7 @@
 """
 Demo de Consulta #2: Top-N servicios por costo acumulado en los últimos 14 días.
 
-Reusa la misma lógica de conexión que gold_to_serving_cassandra.py
+Reusa la misma lógica de conexión que los scripts de serving Cassandra.
 (soporta AstraDB cloud o Cassandra local via cassandra_config.json).
 
 Uso:
