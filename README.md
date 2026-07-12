@@ -159,14 +159,15 @@ Este paso requiere tener una base de datos activa. Elegí una de las siguientes 
      }
    }
    ```
-5. **Cargar las 5 tablas:** Ejecutá la carga para cada uno de los 5 marts Gold:
+5. **Cargar las 5 tablas:** Ejecutá la carga para cada uno de los 5 marts Gold. Las tablas streaming usan `streaming_gold_to_serving_cassandra.py`; las tablas batch usan `batch_gold_to_serving_cassandra.py`:
    ```bash
-   python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table org_daily_usage_by_service
-   python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table revenue_by_org_month
-   python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table tickets_by_org_date
-   python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table genai_tokens_by_org_date
-   python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table cost_anomaly_mart
+   python streaming_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table org_daily_usage_by_service
+   python streaming_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table cost_anomaly_mart
+   python streaming_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table genai_tokens_by_org_date
+   python batch_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table revenue_by_org_month
+   python batch_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table tickets_by_org_date
    ```
+   `gold_to_serving_cassandra.py` queda disponible como wrapper de compatibilidad para comandos anteriores.
    Verificá los resultados en la **CQL Console** de la web de Astra ejecutando las consultas en `cql/02_queries_finops.cql`.
 
 #### Opción B — Cassandra Local con Docker
@@ -189,14 +190,15 @@ Este paso requiere tener una base de datos activa. Elegí una de las siguientes 
      }
    }
    ```
-4. **Cargar las 5 tablas:** Ejecutá la carga para cada uno de los 5 marts Gold:
+4. **Cargar las 5 tablas:** Ejecutá la carga para cada uno de los 5 marts Gold. Las tablas streaming usan `streaming_gold_to_serving_cassandra.py`; las tablas batch usan `batch_gold_to_serving_cassandra.py`:
    ```bash
-   python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table org_daily_usage_by_service
-   python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table revenue_by_org_month
-   python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table tickets_by_org_date
-   python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table genai_tokens_by_org_date
-   python gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table cost_anomaly_mart
+   python streaming_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table org_daily_usage_by_service
+   python streaming_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table cost_anomaly_mart
+   python streaming_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table genai_tokens_by_org_date
+   python batch_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table revenue_by_org_month
+   python batch_gold_to_serving_cassandra.py --write-serving --config config/cassandra_config.json --table tickets_by_org_date
    ```
+   `gold_to_serving_cassandra.py` queda disponible como wrapper de compatibilidad para comandos anteriores.
    Para probar escritura paralela en datasets grandes, agregá `--write-mode executor` al comando correspondiente. Por default se escribe con driver, dado que en este proyecto se está trabajando con volumenes pequeños.
    
    Para validar localmente, conectate a cqlsh:
@@ -224,7 +226,7 @@ El script corre, en orden:
 1. `streaming_landing_to_bronze.py`
 2. `bronze_to_silver.py`
 3. `silver_to_gold.py`
-4. `gold_to_serving_cassandra.py` para las 3 tablas streaming
+4. `streaming_gold_to_serving_cassandra.py` para las 3 tablas streaming
 5. Las consultas de verificación equivalentes a `cql/02_queries_finops.cql`
 
 Por defecto usa `--write-mode driver` para Cassandra. Para probar escritura paralela:
@@ -242,7 +244,7 @@ El script corre, en orden:
 1. `batch_landing_to_bronze.py`
 2. `batch_bronze_to_silver.py`
 3. `batch_silver_to_gold.py`
-4. `gold_to_serving_cassandra.py` para las 2 tablas batch
+4. `batch_gold_to_serving_cassandra.py` para las 2 tablas batch
 5. Las consultas de verificación de revenue mensual y tickets diarios
 
 ## Arquitectura y Detalles del Diseño

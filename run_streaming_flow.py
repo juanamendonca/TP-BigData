@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
         "--write-mode",
         choices=["driver", "executor"],
         default="driver",
-        help="Cassandra write mode passed to gold_to_serving_cassandra.py.",
+        help="Cassandra write mode passed to streaming_gold_to_serving_cassandra.py.",
     )
     parser.add_argument("--org-id", type=str, default="org_xaji0y6d")
     parser.add_argument("--month-bucket", type=str, default="2025-07")
@@ -226,7 +226,7 @@ def main() -> int:
         run_step(
             [
                 python,
-                "gold_to_serving_cassandra.py",
+                "streaming_gold_to_serving_cassandra.py",
                 "--write-serving",
                 "--config",
                 str(args.config),
