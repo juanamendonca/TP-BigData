@@ -149,7 +149,14 @@ def load_config(config_path: str, args: argparse.Namespace) -> argparse.Namespac
 
     if mode == "astradb":
         if args.astradb_bundle is None:
-            args.astradb_bundle = section.get("bundle")
+            bundle_val = section.get("bundle")
+            if bundle_val:
+                bundle_path = Path(bundle_val)
+                if not bundle_path.exists():
+                    sibling_path = Path(config_path).parent / bundle_val
+                    if sibling_path.exists():
+                        bundle_val = str(sibling_path.resolve())
+                args.astradb_bundle = bundle_val
         if args.astradb_token is None:
             args.astradb_token = section.get("token")
     else:
