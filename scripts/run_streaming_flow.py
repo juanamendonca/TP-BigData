@@ -74,7 +74,7 @@ def load_config(path: Path) -> dict[str, Any]:
         return json.load(f)
 
 
-def build_cluster(cfg: dict[str, Any]):
+def build_cluster(cfg: dict[str, Any], config_path: Path | None = None):
     from cassandra.auth import PlainTextAuthProvider
     from cassandra.cluster import Cluster
 
@@ -83,9 +83,16 @@ def build_cluster(cfg: dict[str, Any]):
     keyspace = section.get("keyspace", "finops")
 
     if mode == "astradb":
+        bundle_val = section["bundle"]
+        if config_path:
+            bundle_path = Path(bundle_val)
+            if not bundle_path.exists():
+                sibling_path = config_path.parent / bundle_val
+                if sibling_path.exists():
+                    bundle_val = str(sibling_path.resolve())
         auth_provider = PlainTextAuthProvider("token", section["token"])
         cluster = Cluster(
-            cloud={"secure_connect_bundle": section["bundle"]},
+            cloud={"secure_connect_bundle": bundle_val},
             auth_provider=auth_provider,
         )
     else:
@@ -131,8 +138,8 @@ def print_rows(label: str, rows, limit: int = 20) -> None:
     print(f"[OK] {label}: rows={total_count}")
 
 
-def run_verification_queries(cfg: dict[str, Any], args: argparse.Namespace) -> None:
-    cluster, keyspace = build_cluster(cfg)
+def run_verification_queries(cfg: dict[str, Any], config_path: Path, args: argparse.Namespace) -> None:
+    cluster, keyspace = build_cluster(cfg, config_path)
     session = cluster.connect(keyspace)
 
     try:
@@ -243,7 +250,7 @@ def main() -> int:
             env,
         )
 
-    run_verification_queries(load_config(config_path), args)
+    run_verification_queries(load_config(config_path), config_path, args)
     print("\n[OK] Streaming flow completed end-to-end.")
     return 0
 
