@@ -18,25 +18,31 @@ Para ver las instrucciones de instalación y los comandos de ejecución, consult
 **Script principal:** `scripts/batch-flow/batch_landing_to_bronze.py`
 
 #### Qué hace el script:
-- Lee los maestros CSV desde `datalake/landing` con esquema explícito (sin inferencia): `customers_orgs`, `users`, `billing_monthly`, y `support_tickets`.
+- Lee los maestros y transaccionales CSV desde `datalake/landing` con esquema explícito (sin inferencia). Por defecto procesa las 7 tablas provistas: `billing_monthly`, `customers_orgs`, `marketing_touches`, `nps_surveys`, `resources`, `support_tickets` y `users` (seleccionables con `--tables`).
 - Agrega columnas técnicas:
   - `ingest_ts`
   - `source_file`
   - `batch_date`
+- Aplica controles básicos de calidad: filtro `NOT NULL` sobre claves críticas y dedupe por las claves naturales de cada tabla.
 - Escribe Bronze en formato Parquet con particionado sensato por tabla:
   - `billing_monthly`: particionado por `month`.
-  - `support_tickets`: particionado por `year` y `month` (según `created_at`).
-  - `customers_orgs` y `users`: sin partición (tablas maestras pequeñas).
-- Aplica controles básicos de calidad: filtro `NOT NULL` sobre claves críticas.
+  - `support_tickets`: particionado por `created_date` (derivada de `created_at`).
+  - `marketing_touches`: particionado por `touch_date` (derivada de `timestamp`).
+  - `nps_surveys`: particionado por `survey_date`.
+  - `resources`: particionado por `batch_date`.
+  - `customers_orgs` y `users`: particionado por `load_date` (= `batch_date` del lote; tablas maestras pequeñas, una partición por corrida).
 - Genera manifest de control con conteos de lectura, post-calidad, post-dedupe y escritura.
-- Es idempotente por partición: reescribe las particiones objetivo del lote ejecutado.
+- Es idempotente por partición: reescribe las particiones objetivo del lote ejecutado (`partitionOverwriteMode=dynamic`).
 
 #### Salidas esperadas:
 Parquet Bronze por tabla:
 - `billing_monthly`: `datalake/bronze/batch/billing_monthly/month=YYYY-MM-DD/`
-- `support_tickets`: `datalake/bronze/batch/support_tickets/year=YYYY/month=MM/`
-- `customers_orgs`: `datalake/bronze/batch/customers_orgs/`
-- `users`: `datalake/bronze/batch/users/`
+- `support_tickets`: `datalake/bronze/batch/support_tickets/created_date=YYYY-MM-DD/`
+- `marketing_touches`: `datalake/bronze/batch/marketing_touches/touch_date=YYYY-MM-DD/`
+- `nps_surveys`: `datalake/bronze/batch/nps_surveys/survey_date=YYYY-MM-DD/`
+- `resources`: `datalake/bronze/batch/resources/batch_date=YYYY-MM-DD/`
+- `customers_orgs`: `datalake/bronze/batch/customers_orgs/load_date=YYYY-MM-DD/`
+- `users`: `datalake/bronze/batch/users/load_date=YYYY-MM-DD/`
 - Manifest de corrida: `datalake/bronze/_control/batch_date=YYYY-MM-DD/manifest.json`
 
 ---
@@ -213,5 +219,5 @@ Las consultas se validaron directamente en Cassandra local (`cqlsh`). Los result
 3. **Cálculo de Anomalías con Z-Score**: Se implementó la detección estadística de anomalías de costo calculando el Z-Score por servicio. Para resolver la limitación de Structured Streaming sobre operaciones de ventana dinámicas complejas, se adoptó el patrón **Static-to-Stream Join**, donde las métricas de media y desviación estándar de referencia se calculan estáticamente a partir de los datos acumulados en Bronze y se cruzan con el stream en tiempo real.
 4. **Idempotencia basada en Upserts de Cassandra**: Al diseñar las tablas con claves de partición naturales (`org_id`, `month_bucket`, `event_date`, `service`), cualquier ejecución repetida de los pipelines simplemente actualiza los valores existentes en lugar de duplicar registros, garantizando la idempotencia completa de punta a punta.
 5. **Separación de Serving Batch vs Streaming**: Para los pipelines batch de Serving, el uso de Spark Structured Streaming con parquet file source generaría checkpoints innecesarios y una simulación continua ineficiente sobre tablas estáticas. Se resolvió la carga mediante `spark.read` estático acoplado a escrituras mediante `RDD.foreachPartition` directamente a Cassandra, mejorando el consumo de recursos.
-6. **Enriquecimiento acotado al alcance de serving**: El stream de eventos se enriquece con `customers_orgs` por `org_id`, manteniendo el grano evento y evitando columnas que no alimentan las consultas mínimas de Cassandra. `users` y `resources` se conservan en Bronze como maestros disponibles, pero no se incorporan al mart operativo porque no son necesarios para costos, requests, revenue, tickets ni tokens GenAI.
+6. **Enriquecimiento acotado al alcance de serving**: El stream de eventos se enriquece con `customers_orgs` por `org_id`, manteniendo el grano evento y evitando columnas que no alimentan las consultas mínimas de Cassandra. Los maestros `users`, `resources`, `nps_surveys` y `marketing_touches` se ingestan y conservan en Bronze como fuentes disponibles y reproducibles, pero no se incorporan a los marts porque no son necesarios para costos, requests, revenue, tickets ni tokens GenAI.
 7. **Cálculo de CPU y Storage Hours**: Se agregaron las columnas `cpu_hours` y `storage_gb_hours` al mart Gold operativo diario mediante el mapeo selectivo de las métricas correspondientes en la agregación por ventana diaria de PySpark, cubriendo la totalidad de las métricas de uso requeridas por el enunciado.
